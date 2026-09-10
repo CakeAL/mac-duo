@@ -26,7 +26,9 @@ public final class FrostOverlayController: NSObject {
     @ObservationIgnored private var pendingFrame: CVPixelBuffer?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
-    private var currentIntensity: Double = 0
+    private var currentProgress: Double = 0
+    /// 展开侧是否镜像：顶端钉住、底端收窄。
+    private var currentMirror = false
     private var lastDrawnIntensity: Double = -1
     private var needsRedraw = false
     private var frameCounter = 0
@@ -61,6 +63,12 @@ public final class FrostOverlayController: NSObject {
             view.isPaused = true
             view.preferredFramesPerSecond = 60
             view.layer?.isOpaque = true
+            // The overlay shows captured pixels unchanged, so the layer has to be
+            // tagged with the space those pixels are encoded in. Untagged, macOS
+            // treats the numbers as belonging to the display, and the moment the
+            // overlay appears the whole screen looks washed out — the "it just
+            // goes grey" at 90°.
+            (view.layer as? CAMetalLayer)?.colorspace = Self.overlayColorSpace
             metalView = view
 
             let window = NSWindow(
@@ -117,14 +125,20 @@ public final class FrostOverlayController: NSObject {
         start(capture: capture)
     }
 
+    /// The colour space of the captured frames, as configured in CaptureEngine.
+    private static let overlayColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+
     // MARK: - Intensity
 
     /// - Parameter progress: 0 hides the overlay entirely, 1 is fully folded.
-    public func update(progress: Double) {
+    public func update(progress: Double, mirror: Bool = false) {
         guard isRunning else { return }
-        let clamped = min(max(progress, 0), 1)
-        guard abs(clamped - currentIntensity) > 0.0008 else { return }
-        currentIntensity = clamped
+        // Below this the effect is not visible, and showing a captured copy of the
+        // screen for nothing would only add the capture's lag to everything.
+        let clamped = min(max(progress, 0), 1) < 0.004 ? 0 : min(max(progress, 0), 1)
+        guard abs(clamped - currentProgress) > 0.0008 else { return }
+        currentProgress = clamped
+        currentMirror = mirror
         needsRedraw = true
 
         if clamped <= 0 {
@@ -147,7 +161,7 @@ public final class FrostOverlayController: NSObject {
     // MARK: - Frames
 
     private func handle(frame: CVPixelBuffer) {
-        guard isRunning, currentIntensity > 0 else { return }
+        guard isRunning, currentProgress > 0 else { return }
         pendingFrame = frame
         needsRedraw = true
         presentIfPossible()
@@ -208,7 +222,7 @@ extension FrostOverlayController: MTKViewDelegate {
     public nonisolated func draw(in view: MTKView) {
         MainActor.assumeIsolated {
             guard let renderer, let window, window.isVisible else { return }
-            guard currentIntensity > 0 || lastDrawnIntensity != 0 else { return }
+            guard currentProgress > 0 || lastDrawnIntensity != 0 else { return }
             guard needsRedraw else { return }
             guard let frame = pendingFrame,
                   let drawable = view.currentDrawable
@@ -216,24 +230,18 @@ extension FrostOverlayController: MTKViewDelegate {
 
             let settings = self.settings
 
-            // The blur radius is authored in points, the picture is in pixels.
-            let pointWidth = max(window.frame.width, 1)
-            let displayScale = window.backingScaleFactor > 0
-                ? window.backingScaleFactor
-                : view.drawableSize.width / pointWidth
-
             let rendered = renderer.render(
                 pixelBuffer: frame,
-                progress: currentIntensity,
+                progress: currentProgress,
+                mirror: currentMirror,
                 settings: settings,
                 drawable: drawable,
-                viewSize: view.drawableSize,
-                displayScale: displayScale
+                viewSize: view.drawableSize
             )
 
             if rendered {
                 needsRedraw = false
-                lastDrawnIntensity = currentIntensity
+                lastDrawnIntensity = currentProgress
                 noteRenderedFrame()
             }
         }

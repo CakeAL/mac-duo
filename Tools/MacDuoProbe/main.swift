@@ -3,18 +3,16 @@
 //  MacDuo (verification harness)
 //
 //  Exercises everything the overlay needs at runtime, without opening a window:
-//  the shader library, the pipelines, the fold projection, the blur ramp and the
-//  shadow ramp. Run it with ./verify.sh — a broken shader or a Metal regression
-//  then fails before the app is ever launched.
+//  the shader library, the pipelines, the trapezoid and the blur ramp. Run it
+//  with ./verify.sh — a broken shader or a Metal regression then fails before the
+//  app is ever launched.
 //
 //  The four frames each isolate one claim:
 //
-//    measure  checker ramp + a white band at the top of the *picture* and a black
-//             one at its bottom  -> where the picture lands after the fold
-//    uniform  flat white          -> the shadow ramp and the panel's far edge
-//    edge     left black, right white -> the blur *radius* per row, measured as a
-//             transition width
-//    preview  a stand-in desktop  -> the PNGs, for eyeballing
+//    measure  red ramp + checker + a white top band and a black bottom band
+//    white    flat white            -> the trapezoid's outline and the black around it
+//    edge     left black, right white -> the blur radius per row, as a transition width
+//    preview  a stand-in desktop    -> the PNGs, for eyeballing
 //
 //  Every pixel access goes through the channel helpers below. The capture format
 //  is BGRA, and reading the wrong offset silently shifts the whole sample, which
@@ -29,48 +27,8 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 import AppKit
+import ScreenCaptureKit
 import MacDuoCore
-
-/// The projection the shader runs, in Swift, so the probe can say where a pixel
-/// *should* land instead of only checking that something happened.
-///
-/// The panel is hinged along the display's bottom edge. A ray from the eye
-/// through a display pixel meets the tipped panel at
-///
-///     h = D * s / (D * cos(phi) + (E - s) * sin(phi))
-///
-/// where `s` is the pixel's height above the hinge in screen heights, `h` is the
-/// same distance measured along the panel, and D/E are the eye's distance and
-/// height. h == s while the lid stands at 90°, and runs past 1 as it folds.
-struct Fold {
-    var eyeDistance: Double
-    var eyeHeight: Double
-    var progress: Double
-
-    /// `motion` in the shader.
-    var motion: Double {
-        let p = min(max(progress, 0), 1)
-        return p * p * (3 - 2 * p)
-    }
-
-    private var phi: Double { min(max(progress, 0), 1) * .pi / 2 }
-
-    func panelDistance(screenUp s: Double) -> Double {
-        let sinPhi = sin(phi), cosPhi = cos(phi)
-        return eyeDistance * s / max(eyeDistance * cosPhi + (eyeHeight - s) * sinPhi, 1e-5)
-    }
-
-    /// Screen height at which the panel is this far from the hinge.
-    func screenUp(panelDistance h: Double) -> Double {
-        var low = 0.0
-        var high = 1.0
-        for _ in 0..<32 {
-            let mid = (low + high) / 2
-            if panelDistance(screenUp: mid) < h { low = mid } else { high = mid }
-        }
-        return low
-    }
-}
 
 enum RuntimeProbe {
 
@@ -79,17 +37,6 @@ enum RuntimeProbe {
     static let width = 1280
     static let height = 800
     static let rowBytes = width * 4
-
-    /// The screen row a picture row ends up on, at a given fold.
-    static func row(atPanelDistance h: Double, fold: Fold) -> Int {
-        min(max(Int((1 - fold.screenUp(panelDistance: h)) * Double(height) + 0.5), 0), height - 1)
-    }
-
-    /// The panel distance a screen row actually shows. Rows are quantised, and
-    /// near the far edge the ramps are steep enough for that to matter.
-    static func panelDistance(ofRow row: Int, fold: Fold) -> Double {
-        fold.panelDistance(screenUp: 1 - (Double(row) + 0.5) / Double(height))
-    }
 
     /// Builds a BGRA frame, one pixel at a time, through `paint`.
     static func makeBuffer(_ paint: (Int, Int) -> (r: UInt8, g: UInt8, b: UInt8)) -> CVPixelBuffer? {
@@ -126,9 +73,9 @@ enum RuntimeProbe {
         return buffer
     }
 
-    /// The measuring frame. The first 24 rows of the *picture* are flat white and
-    /// its last 24 rows are flat black, so where those two boundaries land on
-    /// screen is a direct read-out of the projection.
+    /// The measuring frame: a 4 px checker over a horizontal red ramp, with a
+    /// flat white band at the top of the picture and a flat black one at the
+    /// bottom, so the orientation cannot be faked.
     static func makeMeasureFrame() -> CVPixelBuffer? {
         makeBuffer { x, y in
             if y < 24 { return (255, 255, 255) }
@@ -138,9 +85,9 @@ enum RuntimeProbe {
         }
     }
 
-    /// Flat white: blurring it changes nothing, so what is left is the shadow
-    /// ramp and the panel's far edge.
-    static func makeUniformFrame() -> CVPixelBuffer? {
+    /// Flat white: the picture is one solid colour, so what is left after the
+    /// trapezoid is its outline and the black around it.
+    static func makeWhiteFrame() -> CVPixelBuffer? {
         makeBuffer { _, _ in (255, 255, 255) }
     }
 
@@ -210,17 +157,17 @@ enum RuntimeProbe {
     // MARK: - Pixel access (BGRA)
 
     @inline(__always)
-    static func blue(_ buffer: [UInt8], row: Int, x: Int) -> Int {
+    static func blue(_ buffer: [UInt8], _ row: Int, _ x: Int) -> Int {
         index(buffer, row: row, x: x, offset: 0)
     }
 
     @inline(__always)
-    static func green(_ buffer: [UInt8], row: Int, x: Int) -> Int {
+    static func green(_ buffer: [UInt8], _ row: Int, _ x: Int) -> Int {
         index(buffer, row: row, x: x, offset: 1)
     }
 
     @inline(__always)
-    static func red(_ buffer: [UInt8], row: Int, x: Int) -> Int {
+    static func red(_ buffer: [UInt8], _ row: Int, _ x: Int) -> Int {
         index(buffer, row: row, x: x, offset: 2)
     }
 
@@ -243,6 +190,18 @@ enum RuntimeProbe {
         return out
     }
 
+    /// First and last pixel of a row that is brighter than the black around it.
+    static func litRun(_ buffer: [UInt8], row: Int) -> (first: Int, last: Int, count: Int) {
+        var first = -1
+        var last = -1
+        for x in 0..<width where red(buffer, row, x) > 24 || green(buffer, row, x) > 24 {
+            if first < 0 { first = x }
+            last = x
+        }
+        guard first >= 0 else { return (0, width - 1, 0) }
+        return (first, last, last - first + 1)
+    }
+
     /// Mean absolute gradient inside a band of rows, on the striping channels.
     static func detail(_ buffer: [UInt8], row: Int, band: Int = 16) -> Double {
         var total = 0.0
@@ -254,8 +213,8 @@ enum RuntimeProbe {
 
         for y in first..<last {
             for x in xFirst..<xLast {
-                total += abs(Double(green(buffer, row: y, x: x + 1)) - Double(green(buffer, row: y, x: x)))
-                total += abs(Double(blue(buffer, row: y + 1, x: x)) - Double(blue(buffer, row: y, x: x)))
+                total += abs(Double(green(buffer, y, x + 1)) - Double(green(buffer, y, x)))
+                total += abs(Double(blue(buffer, y + 1, x)) - Double(blue(buffer, y, x)))
                 samples += 2
             }
         }
@@ -266,8 +225,8 @@ enum RuntimeProbe {
     /// row's own black and white levels. For a Gaussian of standard deviation s
     /// the 10...90 width is 2.563 s, so this reads the blur out directly.
     static func transitionWidth(_ buffer: [UInt8], row: Int) -> Double {
-        let blackLevel = Double(red(buffer, row: row, x: 200))
-        let whiteLevel = Double(red(buffer, row: row, x: width - 200))
+        let blackLevel = Double(red(buffer, row, 200))
+        let whiteLevel = Double(red(buffer, row, width - 200))
         let span = whiteLevel - blackLevel
         guard span > 40 else { return -1 }
 
@@ -275,43 +234,20 @@ enum RuntimeProbe {
         let high = blackLevel + span * 0.9
         var lowX = -1
         var highX = -1
-        for x in (width / 2 - 360)..<(width / 2 + 360) {
-            let value = Double(red(buffer, row: row, x: x))
+        for x in (width / 2 - 400)..<(width / 2 + 400) {
+            let value = Double(red(buffer, row, x))
             if lowX < 0, value >= low { lowX = x }
             if highX < 0, value >= high { highX = x }
         }
         guard lowX >= 0, highX >= 0 else { return -1 }
+        if ProcessInfo.processInfo.environment["MACDUO_PROBE_DEBUG"] == "1" {
+            print(String(format: "    [span] row %d black %.0f white %.0f low %.1f high %.1f -> %d..%d",
+                         row, blackLevel, whiteLevel, low, high, lowX, highX))
+        }
         return Double(highX - lowX)
     }
 
-    /// What the shader should produce for a flat white pixel this far along the
-    /// panel, straight from the reference's formulas.
-    struct Ramps {
-        var falloff: Double
-        var hingeClear: Double
-        var darkenStart: Double
-        var darkenGain: Double
-        var frostOpacity: Double
-    }
-
-    static func expectedGray(panelDistance h: Double, ramps: Ramps, motion: Double) -> Double {
-        let hingeClear = min(max(ramps.hingeClear, 0), 0.8)
-        let edge = min(max((h - hingeClear) / max(1 - hingeClear, 1e-4), 0), 1)
-        let falloff = min(max(ramps.falloff, 0.05), 4)
-        let ramp = pow(edge, falloff)
-
-        let start = min(max(ramps.darkenStart, 0), 0.9)
-        let darkenGradient = min(max((edge - start) / max(1 - start, 1e-4), 0), 1)
-        let effect = motion * pow(darkenGradient, falloff)
-        let shadow = min(1, effect * max(ramps.darkenGain, 0))
-
-        var gray = 255.0 * (1 - shadow)
-        let wash = min(1, max(ramps.frostOpacity, 0) * (motion * ramp))
-        gray = gray * (1 - wash) + 255.0 * wash
-        return gray
-    }
-
-    static func makeTarget(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
+    static func makeTarget(device: MTLDevice) -> MTLTexture? {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: MetalFrostRenderer.capturePixelFormat,
             width: width,
@@ -338,7 +274,7 @@ enum RuntimeProbe {
             fail("shader library unavailable: \(error)")
         }
         print("library functions:", library.functionNames.sorted().joined(separator: ", "))
-        for name in ["frost_vertex", "frost_copy", "frost_fragment"] {
+        for name in ["frost_vertex", "frost_vertex_flat", "frost_copy", "frost_fragment"] {
             guard library.makeFunction(name: name) != nil else {
                 fail("shader function '\(name)' missing from the library")
             }
@@ -352,7 +288,7 @@ enum RuntimeProbe {
         }
 
         guard let measure = makeMeasureFrame(),
-              let uniform = makeUniformFrame(),
+              let white = makeWhiteFrame(),
               let edge = makeEdgeFrame(),
               let preview = makePreviewFrame() else {
             fail("could not create the test frames")
@@ -378,19 +314,14 @@ enum RuntimeProbe {
             print("pipelines: OK")
             print("")
 
-            let full = Ramps(falloff: settings.rampFalloff,
-                             hingeClear: settings.hingeClearFraction,
-                             darkenStart: settings.darkeningStart,
-                             darkenGain: settings.farDarkening,
-                             frostOpacity: settings.frostOpacity)
-
-            /// Renders a frame and reads it back.
-            @MainActor func render(_ frame: CVPixelBuffer, progress: Double) -> [UInt8] {
-                guard let target = makeTarget(device: device, width: width, height: height) else {
+            @MainActor func render(_ frame: CVPixelBuffer, progress: Double,
+                                   mirror: Bool = false) -> [UInt8] {
+                guard let target = makeTarget(device: device) else {
                     fail("could not allocate a render target")
                 }
                 guard renderer.renderOffscreen(pixelBuffer: frame,
                                                progress: progress,
+                                               mirror: mirror,
                                                settings: settings,
                                                target: target,
                                                displayScale: 1) else {
@@ -426,194 +357,138 @@ enum RuntimeProbe {
             print(String(format: "identity: %.3f%% of samples differ by more than 2 (worst %d)",
                          mismatchShare * 100, worst))
             guard mismatchShare < 0.0005 else {
-                fail(String(format: "the picture is modified at progress 0 (%.2f%% of samples off, worst %d)",
+                fail(String(format: "the picture is modified at progress 0 (%.2f%% off, worst %d)",
                             mismatchShare * 100, worst))
             }
-            guard red(untouched, row: 6, x: 640) > 250,
-                  red(untouched, row: height - 6, x: 640) < 5 else {
+            guard red(untouched, 6, 640) > 250, red(untouched, height - 6, 640) < 5 else {
                 fail("the picture is not upright")
             }
             print("orientation: top row white, bottom row black — upright")
             print("")
 
-            // MARK: 2. The fold projection: the picture lands where it should
+            // MARK: 2. The trapezoid: bottom edge pinned, top edge drawn in
 
-            // Geometry on its own: no blur and no shadow, so the boundaries
-            // between the test frame's flat bands and its checker stay sharp and
-            // the measured rows are the projection's, not the blur's.
-            settings.blurRadiusPoints = 0
+            // Geometry on its own: no blur, no extras, so the outline is exact.
+            settings.maxBlurRadius = 0
             settings.farDarkening = 0
             settings.frostOpacity = 0
 
-            print("== 2. the fold: the picture is foreshortened towards the hinge")
-            print("  progress   panel visible   top band: row (want)   bottom band: row (want)")
+            print("== 2. the trapezoid: the bottom edge does not move")
+            print("  progress   row%   lit run          width   expected")
+            for progress in [0.25, 0.5, 1.0] {
+                let frame = render(white, progress: progress)
+                let topScale = settings.topWidthRatio(at: progress)
+                var previousCount = 0
+                for fraction in [0.01, 0.25, 0.5, 0.75, 0.99] {
+                    let row = min(max(Int(Double(height) * fraction), 2), height - 3)
+                    let screenUp = 1 - (Double(row) + 0.5) / Double(height)
+                    let expected = Double(width) * (1 + (topScale - 1) * screenUp)
+                    let run = litRun(frame, row: row)
+                    print(String(format: "  %8.2f   %4.0f%%   %5d … %-5d   %6d   %8.0f",
+                                 progress, fraction * 100, run.first, run.last, run.count, expected))
 
-            /// The picture's white band ends at panel distance 1 - 24/h, and its
-            /// black band starts 24 rows above the hinge.
-            func bandRows(fold: Fold) -> (top: Int, bottom: Int) {
-                (row(atPanelDistance: 1 - 24.5 / Double(height), fold: fold),
-                 row(atPanelDistance: 24.5 / Double(height), fold: fold))
-            }
+                    guard abs(Double(run.count) - expected) <= 6 else {
+                        fail(String(format: "at progress %.2f row %d the picture is %d px wide, expected %.0f",
+                                    progress, row, run.count, expected))
+                    }
+                    // Straight sides: the run can only grow as the row descends.
+                    guard run.count >= previousCount else {
+                        fail("the sides are not straight at progress \(progress), row \(row)")
+                    }
+                    previousCount = run.count
 
-            for progress in [0.25, 0.5, 0.75] {
-                let fold = Fold(eyeDistance: settings.eyeDistance,
-                                eyeHeight: settings.eyeHeight,
-                                progress: progress)
-                let frame = render(measure, progress: progress)
-                let wanted = bandRows(fold: fold)
-                let panelTopRow = row(atPanelDistance: 1, fold: fold)
-
-                var firstPictureRow = height - 1
-                for row in 0..<height where red(frame, row: row, x: 640) > 6 {
-                    firstPictureRow = row
-                    break
+                    if fraction == 0.99 {
+                        guard run.count >= width - 6 else {
+                            fail(String(format: "the bottom edge moved at progress %.2f (%d of %d px)",
+                                        progress, run.count, width))
+                        }
+                    }
                 }
-                // The picture's far edge is antialiased into the black behind
-                // it, so look for the band's far side only after the white band
-                // has actually shown up.
-                var topBandEnd = -1
-                var seenBright = false
-                for row in firstPictureRow..<height {
-                    let value = green(frame, row: row, x: 640)
-                    if value > 240 { seenBright = true; continue }
-                    if seenBright, value < 200 { topBandEnd = row; break }
-                }
-                var bottomBandStart = -1
-                for row in stride(from: height - 1, through: firstPictureRow, by: -1)
-                where red(frame, row: row, x: 640) > 8 {
-                    bottomBandStart = row
-                    break
-                }
-
-                print(String(format: "  %8.2f   %8.0f%%          row %4d (%4d)        row %4d (%4d)",
-                             progress,
-                             100 * fold.screenUp(panelDistance: 1),
-                             topBandEnd, wanted.top, bottomBandStart, wanted.bottom))
-
-                guard topBandEnd >= 0, bottomBandStart >= 0 else {
-                    fail("could not find the picture's bands at progress \(progress)")
-                }
-                guard abs(topBandEnd - wanted.top) <= 4 else {
-                    fail(String(format: "the picture's top band lands at row %d, expected %d (progress %.2f)",
-                                topBandEnd, wanted.top, progress))
-                }
-                guard abs(bottomBandStart - wanted.bottom) <= 4 else {
-                    fail(String(format: "the picture's bottom band lands at row %d, expected %d (progress %.2f)",
-                                bottomBandStart, wanted.bottom, progress))
-                }
-                // Above the panel there is only the space behind the lid.
-                for row in 0..<max(panelTopRow - 2, 1) where red(frame, row: row, x: 640) != 0 {
-                    fail("row \(row) above the panel is not black at progress \(progress)")
+                // Everything above the top edge, and the upper corners, are black.
+                guard red(frame, 1, 1) == 0, green(frame, 1, 1) == 0, blue(frame, 1, 1) == 0,
+                      red(frame, 1, width - 2) == 0 else {
+                    fail("the space outside the trapezoid is not black at progress \(progress)")
                 }
             }
             print("")
 
-            settings.blurRadiusPoints = 72
-            settings.farDarkening = 2.0
+            // 镜像：能动的是底边，顶边钉在全宽。
+            settings.mirror = true
+            let mirrored = render(white, progress: 1.0, mirror: true)
+            let topRun = litRun(mirrored, row: 2)
+            let bottomRun = litRun(mirrored, row: height - 3)
+            print(String(format: "mirrored: top %d px wide, bottom %d px (expect full width on top, "
+                         + "%.0f%% at the bottom)", topRun.count, bottomRun.count,
+                         100 * settings.topWidthRatio(at: 1)))
+            guard topRun.count >= width - 6 else {
+                fail("the mirrored shape does not pin the top edge (\(topRun.count) px)")
+            }
+            guard abs(Double(bottomRun.count) - Double(width) * settings.topWidthRatio(at: 1)) <= 6 else {
+                fail("the mirrored shape does not narrow the bottom edge (\(bottomRun.count) px)")
+            }
+            settings.mirror = false
 
-            // MARK: 3. The blur ramp, measured along the panel
+            settings.maxBlurRadius = 72
 
-            let rampProgress = 0.5
-            let rampFold = Fold(eyeDistance: settings.eyeDistance,
-                                eyeHeight: settings.eyeHeight,
-                                progress: rampProgress)
-            let blurred = render(measure, progress: rampProgress)
-            let edgeBlurred = render(edge, progress: rampProgress)
+            // MARK: 3. The blur ramp: heaviest at the top, nothing at the hinge
 
-            print("== 3. the blur ramp along the panel: sharp at the hinge, frosted far out")
-            print("  panel   screen row   wanted sigma   measured sigma   detail kept")
+            let progress = 1.0
+            let blurred = render(measure, progress: progress)
+            let edgeBlurred = render(edge, progress: progress)
+
+            print("== 3. the blur ramp: heaviest at the top, nothing at the hinge")
+            print("  row%   wanted sigma   measured sigma   detail kept")
             var sigmas: [Double] = []
             var wanted: [Double] = []
-            var panelDistances: [Double] = []
-            for h in [0.06, 0.25, 0.45, 0.65, 0.85] {
-                let screenRow = min(max(row(atPanelDistance: h, fold: rampFold), 4), height - 5)
-                let actual = panelDistance(ofRow: screenRow, fold: rampFold)
-                let expected = settings.blurRadiusPoints * rampFold.motion
-                    * pow(actual, settings.rampFalloff)
-                let measured = transitionWidth(edgeBlurred, row: screenRow) / 2.563
-                let reference = detail(pristine, row: min(max(Int((1 - actual) * Double(height)),
-                                                              0), height - 1))
-                let ratio = reference > 0.0001 ? detail(blurred, row: screenRow) / reference : 1
+            for fraction in [0.02, 0.25, 0.5, 0.75, 0.98] {
+                let row = min(max(Int(Double(height) * fraction), 4), height - 5)
+                let screenUp = 1 - (Double(row) + 0.5) / Double(height)
+                // The blur is done in picture space, and the trapezoid squeezes
+                // the picture horizontally, so the width seen on screen is the
+                // radius times the local horizontal scale.
+                let scale = 1 + (settings.topWidthRatio(at: progress) - 1) * screenUp
+                let expected = settings.maxBlurRadius * progress
+                    * pow(screenUp, settings.blurFalloff) * scale
+                let measured = transitionWidth(edgeBlurred, row: row) / 2.563
+                let reference = detail(pristine, row: row)
+                let ratio = reference > 0.0001 ? detail(blurred, row: row) / reference : 1
                 sigmas.append(measured)
                 wanted.append(expected)
-                panelDistances.append(actual)
-                print(String(format: "%8.3f   %10d   %12.1f   %14.1f   %9.1f%%",
-                             actual, screenRow, expected, measured, ratio * 100))
+                print(String(format: "%5.0f%%   %12.1f   %14.1f   %9.1f%%",
+                             fraction * 100, expected, measured, ratio * 100))
             }
             print("")
 
             for index in 1..<sigmas.count {
-                guard sigmas[index] > sigmas[index - 1] else {
-                    fail(String(format: "the blur radius does not grow along the panel: %.1f px at panel "
-                                + "%.2f vs %.1f px nearer the hinge",
-                                sigmas[index], panelDistances[index], sigmas[index - 1]))
+                guard sigmas[index] < sigmas[index - 1] else {
+                    fail(String(format: "the blur does not weaken towards the hinge: %.1f px then %.1f px",
+                                sigmas[index - 1], sigmas[index]))
                 }
-                // The prefilter level follows the picture's own screen-space
-                // footprint, and the fold minifies the picture, so a folded row
-                // blurs a little wider than its nominal radius. Half to 2.5x is
-                // the honest band; the shape is what matters and it is monotone.
-                guard sigmas[index] > wanted[index] * 0.6, sigmas[index] < wanted[index] * 1.6 else {
-                    fail(String(format: "the blur at panel %.2f is %.1f px, wanted about %.1f px",
-                                panelDistances[index], sigmas[index], wanted[index]))
+                guard sigmas[index - 1] > wanted[index - 1] * 0.6,
+                      sigmas[index - 1] < wanted[index - 1] * 1.6 || wanted[index - 1] < 1.5 else {
+                    fail(String(format: "the blur near the top is %.1f px, wanted about %.1f px",
+                                sigmas[index - 1], wanted[index - 1]))
                 }
             }
-            guard sigmas[0] < 2.0 else {
-                fail(String(format: "the hinge is not sharp (sigma %.1f px)", sigmas[0]))
+            guard sigmas[0] > 45 else {
+                fail(String(format: "the top of the picture is barely blurred (sigma %.1f px)", sigmas[0]))
             }
-            print("ramp: zero at the hinge, growing along the panel, monotone throughout")
+            guard sigmas[sigmas.count - 1] < 2.0 else {
+                fail(String(format: "the hinge is not sharp (sigma %.1f px)", sigmas[sigmas.count - 1]))
+            }
+            print("ramp: strongest at the top, monotone down to a sharp hinge")
             print("")
 
-            // MARK: 4. The shadow ramp and the panel's far edge
-
-            let flatSharp = render(uniform, progress: 0)
-            let flatShut = render(uniform, progress: 1.0)
-            let shut = Fold(eyeDistance: settings.eyeDistance,
-                            eyeHeight: settings.eyeHeight,
-                            progress: 1.0)
-
-            print("== 4. the far panel falls into the dark, and behind the lid is black")
-            print("   panel   screen row   rendered   expected")
-            for h in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95] {
-                let row = min(max(row(atPanelDistance: h, fold: shut), 1), height - 2)
-                let actual = panelDistance(ofRow: row, fold: shut)
-                let rendered = Double(red(flatShut, row: row, x: width / 2))
-                let expected = expectedGray(panelDistance: actual, ramps: full, motion: shut.motion)
-                print(String(format: "%8.3f   %10d   %8.1f   %8.1f", actual, row, rendered, expected))
-                guard abs(rendered - expected) <= 3 else {
-                    fail(String(format: "the shadow at panel %.3f (row %d) is %.1f, expected %.1f",
-                                actual, row, rendered, expected))
-                }
-            }
-
-            let shutPanelTopRow = row(atPanelDistance: 1, fold: shut)
-            guard shutPanelTopRow > 8, shutPanelTopRow < height - 8 else {
-                fail("the panel's far edge lands at row \(shutPanelTopRow), which cannot be right when shut")
-            }
-            for row in 0..<max(shutPanelTopRow - 2, 1) where red(flatShut, row: row, x: width / 2) != 0 {
-                fail("row \(row) above the panel is not black at full fold")
-            }
-            guard red(flatSharp, row: 4, x: width / 2) == 255,
-                  red(flatSharp, row: height - 4, x: width / 2) == 255 else {
-                fail("a flat frame is not passed through untouched at progress 0")
-            }
-            print(String(format: "panel edge: a shut lid leaves the bottom %.0f%% of the screen",
-                         100 * shut.screenUp(panelDistance: 1)))
-            print("shadow: matches the formula on the panel, hinge untouched, behind the lid black")
-            print("")
-
-            // MARK: 5. Preview frames, for eyeballing the effect
+            // MARK: 4. Preview frames, for eyeballing the effect
 
             if let outputDirectory {
                 try? FileManager.default.createDirectory(atPath: outputDirectory,
                                                          withIntermediateDirectories: true)
-                for (name, progress) in [("lid-90", 0.0),
-                                         ("lid-67", 0.25),
-                                         ("lid-45", 0.5),
-                                         ("lid-22", 0.75),
-                                         ("lid-00", 1.0)] {
-                    guard let target = makeTarget(device: device, width: width, height: height) else { break }
+                for (name, value) in [("lid-90", 0.0), ("lid-67", 0.25), ("lid-45", 0.5),
+                                      ("lid-22", 0.75), ("lid-00", 1.0)] {
+                    guard let target = makeTarget(device: device) else { break }
                     _ = renderer.renderOffscreen(pixelBuffer: preview,
-                                                 progress: progress,
+                                                 progress: value,
                                                  settings: settings,
                                                  target: target,
                                                  displayScale: 1)
@@ -623,13 +498,90 @@ enum RuntimeProbe {
                 }
             }
 
-            // MARK: 6. Optional on-screen smoke test
+            // MARK: 4b. Optional diagnostics: the sensor and the angle mapping
+
+            if ProcessInfo.processInfo.environment["MACDUO_PROBE_SENSOR"] == "1" {
+                let sensor = LidAngleSensor()
+                sensor.start()
+                var samples: [Double] = []
+                for _ in 0..<30 {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                    samples.append(sensor.angle)
+                }
+                let low = samples.min() ?? 0
+                let high = samples.max() ?? 0
+                print("")
+                print("== sensor")
+                print(String(format: "status: %@", sensor.statusText))
+                print(String(format: "live reading over 3 s: %.1f° … %.1f° (last %.1f°)",
+                             low, high, samples.last ?? 0))
+                print("A lid being looked at reads roughly 100…135°; a reading near 0 means "
+                      + "the sensor reports the opposite way round.")
+            }
+
+            if ProcessInfo.processInfo.environment["MACDUO_PROBE_MAP"] == "1" {
+                print("")
+                print("== angle -> progress (the effect lives in 0–90°)")
+                print("   angle   progress   top edge   blur at the far edge")
+                for angle in [135.0, 120, 111, 100, 95, 90, 80, 75, 60, 45, 30, 15, 0] {
+                    let value = settings.progress(for: angle)
+                    print(String(format: "%8.0f   %8.2f   %7.0f%%   %12.0f pt",
+                                 angle, value,
+                                 100 * settings.topWidthRatio(at: value),
+                                 settings.blurRadius(at: value)))
+                }
+                // 效果区间是盖角 0–90°：生效角度及以上为零，满强度角度为 1，中间单调。
+                for angle in [settings.activationAngle, settings.activationAngle + 10, 135, 180] {
+                    guard settings.progress(for: angle) == 0 else {
+                        fail(String(format: "progress at %.0f° is %.3f, expected 0 "
+                                    + "(the effect lives between %.0f° and %.0f°)",
+                                    angle, settings.progress(for: angle),
+                                    settings.saturationAngle, settings.activationAngle))
+                    }
+                }
+                for angle in [settings.saturationAngle, 0, -0] {
+                    guard abs(settings.progress(for: angle) - 1) < 1e-9 else {
+                        fail(String(format: "progress at %.0f° is %.3f, expected the full 1.0",
+                                    angle, settings.progress(for: angle)))
+                    }
+                }
+                // 0–90° 这一段必须真的有渐变（不是恒满、也不是恒零）。
+                let middle = settings.progress(for: (settings.activationAngle + settings.saturationAngle) / 2)
+                guard middle > 0.05, middle < 0.95 else {
+                    fail(String(format: "the middle of the range reads %.2f, so the effect is not "
+                                + "gradual across 0–90°", middle))
+                }
+                var previous = 0.0
+                var previousAngle = settings.activationAngle + 5
+                for angle in stride(from: settings.activationAngle, through: settings.saturationAngle, by: -2) {
+                    let value = settings.progress(for: angle)
+                    guard value >= previous - 1e-9 else {
+                        fail(String(format: "progress is not monotone between %.0f° and %.0f°: "
+                                    + "%.2f at %.0f° then %.2f at %.0f°",
+                                    settings.activationAngle, settings.saturationAngle,
+                                    previous, previousAngle, value, angle))
+                    }
+                    previous = value
+                    previousAngle = angle
+                }
+                print(String(format: "zero at or above %.0f°, full at or below %.0f° — the effect "
+                             + "lives in the 0–90° range, graded in between",
+                             settings.activationAngle, settings.saturationAngle))
+            }
+
+            // MARK: 5. Optional on-screen smoke test
 
             if ProcessInfo.processInfo.environment["MACDUO_PROBE_FLASH"] == "1" {
                 runVisualSmokeTest(settings: settings, buffer: preview)
             }
 
-            // MARK: 7. Optional cost measurement
+            // MARK: 5b. 真实捕获的反馈检查
+
+            if ProcessInfo.processInfo.environment["MACDUO_PROBE_CAPTURE"] == "1" {
+                await runCaptureFeedbackCheck()
+            }
+
+            // MARK: 6. Optional cost measurement
 
             if ProcessInfo.processInfo.environment["MACDUO_PROBE_BENCH"] == "1" {
                 runBenchmark(renderer: renderer, frame: preview, settings: settings, device: device)
@@ -644,8 +596,6 @@ enum RuntimeProbe {
 
     // MARK: - Visual smoke test
 
-    /// Puts the real overlay on screen for ~3 s at half fold: the picture
-    /// foreshortened towards the hinge, sharp there, frosted and dark far out.
     @MainActor
     static func runVisualSmokeTest(settings: FrostSettings, buffer: CVPixelBuffer) {
         guard let screen = DisplayResolver.builtInScreen else {
@@ -662,18 +612,110 @@ enum RuntimeProbe {
         host.scheduleFrame(buffer)
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
 
-        host.show(progress: 0.5)
+        host.show(progress: 1.0)
         host.scheduleFrame(buffer)
-        print("flash: on screen now — half folded, foreshortened towards the hinge")
+        print("flash: on screen now — trapezoid, top edge blurred")
         RunLoop.main.run(until: Date().addingTimeInterval(3.0))
 
         host.close()
         print("flash: done")
     }
 
+    // MARK: - Capture feedback check
+
+    /// 覆盖窗口铺满整屏、显示的就是捕获画面：只要它被拍进捕获一帧，这一帧就会变成
+    /// 下一帧的输入，模糊与压暗逐帧累积——屏幕上就会出现一层流动的糊和拖影。
+    ///
+    /// 这个检查用真实捕获复现这件事：先放一个纯红窗口占满内建屏，再抓几帧，然后看
+    /// 捕获里有没有那块红。有红 = 自己被拍了进去 = 反馈。
+    @MainActor
+    static func runCaptureFeedbackCheck() async {
+        print("")
+        print("== 5b. capture feedback check")
+        guard CaptureEngine.hasScreenRecordingPermission else {
+            print("skipped: 没有屏幕录制权限，先在系统设置里授权再跑")
+            return
+        }
+        guard let screen = DisplayResolver.builtInScreen else {
+            print("skipped: 找不到内建屏幕")
+            return
+        }
+
+        // 一个刺眼的纯红窗口，充当覆盖层。
+        let probeWindow = NSWindow(contentRect: screen.frame,
+                                   styleMask: [.borderless],
+                                   backing: .buffered,
+                                   defer: false,
+                                   screen: screen)
+        probeWindow.backgroundColor = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+        probeWindow.isOpaque = true
+        probeWindow.hasShadow = false
+        probeWindow.level = .normal
+        probeWindow.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        probeWindow.orderFrontRegardless()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+
+        // 用 app 真正用的那个过滤器做一次截图，看看红窗口有没有被排除掉。
+        let filter: SCContentFilter
+        do {
+            filter = try await CaptureEngine.makeBuiltInFilter()
+        } catch {
+            print("skipped: 拿不到过滤器（\(error)）")
+            probeWindow.orderOut(nil)
+            return
+        }
+
+        let configuration = SCStreamConfiguration()
+        configuration.width = Int(screen.frame.width * screen.backingScaleFactor)
+        configuration.height = Int(screen.frame.height * screen.backingScaleFactor)
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.showsCursor = false
+        configuration.colorSpaceName = CGColorSpace.sRGB
+        configuration.captureResolution = .best
+
+        let image: CGImage
+        do {
+            image = try await SCScreenshotManager.captureImage(contentFilter: filter,
+                                                               configuration: configuration)
+        } catch {
+            print("skipped: 截图失败（\(error)）")
+            probeWindow.orderOut(nil)
+            return
+        }
+        probeWindow.orderOut(nil)
+        print("screenshot: \(image.width)×\(image.height)")
+
+        // 画进已知布局的位图，再读中心像素（BGRA）。
+        let imageWidth = image.width
+        let imageHeight = image.height
+        var pixels = [UInt8](repeating: 0, count: imageWidth * imageHeight * 4)
+        guard let context = CGContext(data: &pixels,
+                                      width: imageWidth,
+                                      height: imageHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: imageWidth * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                          | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            print("skipped: 无法建立位图上下文")
+            return
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+
+        let offset = ((imageHeight / 2) * imageWidth + (imageWidth / 2)) * 4
+        let middleBlue = Int(pixels[offset])
+        let middleGreen = Int(pixels[offset + 1])
+        let middleRed = Int(pixels[offset + 2])
+        print(String(format: "centre pixel BGRA = %d %d %d", middleBlue, middleGreen, middleRed))
+
+        guard !(middleRed > 180 && middleGreen < 80 && middleBlue < 80) else {
+            fail("覆盖窗口被拍进了捕获：中心像素是纯红。反馈没被排除，屏幕上会出现那层流动的糊")
+        }
+        print("ok: 覆盖窗口没有被拍进捕获，不会出现反馈")
+    }
+
     // MARK: - Benchmark
 
-    /// Times the composite at the real panel size (MACDUO_PROBE_BENCH=1).
     @MainActor
     static func runBenchmark(renderer: MetalFrostRenderer,
                              frame: CVPixelBuffer,
@@ -684,23 +726,29 @@ enum RuntimeProbe {
                    height: $0.frame.height * $0.backingScaleFactor)
         } ?? CGSize(width: 3024, height: 1964)
 
-        guard let target = makeTarget(device: device,
-                                      width: Int(pixelSize.width),
-                                      height: Int(pixelSize.height)) else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: MetalFrostRenderer.capturePixelFormat,
+            width: Int(pixelSize.width),
+            height: Int(pixelSize.height),
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        guard let target = device.makeTexture(descriptor: descriptor) else { return }
 
         print("")
         print(String(format: "== 6. cost at %d×%d, whole screen, 25 taps per pixel",
                      Int(pixelSize.width), Int(pixelSize.height)))
 
         for _ in 0..<3 {
-            _ = renderer.renderOffscreen(pixelBuffer: frame, progress: 0.5, settings: settings,
+            _ = renderer.renderOffscreen(pixelBuffer: frame, progress: 1, settings: settings,
                                          target: target, displayScale: 1)
         }
 
         let iterations = 30
         let start = CACurrentMediaTime()
         for _ in 0..<iterations {
-            _ = renderer.renderOffscreen(pixelBuffer: frame, progress: 0.5, settings: settings,
+            _ = renderer.renderOffscreen(pixelBuffer: frame, progress: 1, settings: settings,
                                          target: target, displayScale: 1)
         }
         let elapsed = CACurrentMediaTime() - start
@@ -711,7 +759,6 @@ enum RuntimeProbe {
 
     // MARK: - PNG output
 
-    /// Saves a texture as a PNG so the effect can be eyeballed without the GUI.
     static func writePNG(texture: MTLTexture, to path: String) throws {
         let textureWidth = texture.width
         let textureHeight = texture.height

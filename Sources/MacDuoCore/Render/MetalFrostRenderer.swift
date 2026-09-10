@@ -2,20 +2,17 @@
 //  MetalFrostRenderer.swift
 //  MacDuo
 //
-//  Progressive blur, driven by the lid angle.
-//
 //  Per frame:
-//    1. the captured display is copied 1:1 into a mipmapped working picture
-//       (no resize, no crop, no keystone: the picture stays where it would be at
-//       90°);
+//    1. the captured screen is copied 1:1 into a mipmapped working picture;
 //    2. the mip chain is generated for it;
-//    3. the composite samples that chain with a blur radius that is zero at the
-//       hinge and maximal at the far edge, and darkens the far edge on top.
+//    3. the composite draws that picture as a trapezoid — bottom edge pinned to
+//       the bottom of the display, top edge narrowed by the fold — over a black
+//       target, and blurs it with a radius that is the full amount at the top of
+//       the picture and zero at the hinge.
 //
-//  Sampling a prefiltered level per tap (level = log2(radius)) is what lets the
-//  radius vary continuously with position without aliasing, which is what makes
-//  the ramp read as one sheet of frosted glass rather than as stacked blur
-//  levels.
+//  Sampling a prefiltered mip level per tap (level = log2(radius)) is what lets
+//  the radius vary continuously from row to row instead of stepping between a
+//  few discrete blur levels.
 //
 
 import Foundation
@@ -26,41 +23,39 @@ import simd
 
 /// Mirrors `FrostUniforms` in MetalFrost.metal.
 ///
-/// The block is laid out as three 16-byte rows so MSL and Swift agree without
-/// padding guesswork. The probe asserts `MemoryLayout<FrostUniforms>.stride`.
+/// Three 16-byte rows, so MSL and Swift agree without padding guesswork. The
+/// probe asserts `MemoryLayout<FrostUniforms>.stride == 48`.
 public struct FrostUniforms {
     // Row 1: picture geometry and fold strength
     var pictureSize: SIMD2<Float> = .zero
     var progress: Float = 0
     var blurRadiusPx: Float = 0
 
-    // Row 2: ramp shape
-    var falloff: Float = 1.35
-    var hingeClear: Float = 0
-    var darkenStart: Float = 0.2
-    var darkenGain: Float = 1.6
-
-    // Row 3: glass, then the viewer (screen heights, as in the reference)
+    // Row 2: the ramp and the trapezoid
+    var falloff: Float = 1.2
+    var darkenGain: Float = 0
+    var topScale: Float = 1
     var frostOpacity: Float = 0
+
+    // Row 3: glass
     var frostSaturation: Float = 1
-    var eyeDistance: Float = 2.5
-    var eyeHeight: Float = 0.5
+    var anchor: Float = 0
+    var pad1: Float = 0
+    var pad2: Float = 0
 }
 
-enum FrostRendererError: Error {
+public enum FrostRendererError: Error {
     case noDevice
     case noFunction(String)
     case noTextureCache
     case textureCreationFailed
-    case noDrawable
 
-    var localizedDescription: String {
+    public var localizedDescription: String {
         switch self {
         case .noDevice: "没有可用的 Metal 设备。"
-        case .noFunction(let name): "着色器函数缺失：\(name)"
+        case .noFunction(let name): "着色器缺失：\(name)"
         case .noTextureCache: "无法创建 Metal 纹理缓存。"
         case .textureCreationFailed: "无法从捕获画面创建纹理。"
-        case .noDrawable: "没有可用的绘制目标。"
         }
     }
 }
@@ -110,6 +105,9 @@ public final class MetalFrostRenderer {
         guard let copyFunction = library.makeFunction(name: "frost_copy") else {
             throw FrostRendererError.noFunction("frost_copy")
         }
+        guard let flatVertexFunction = library.makeFunction(name: "frost_vertex_flat") else {
+            throw FrostRendererError.noFunction("frost_vertex_flat")
+        }
 
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.label = "MacDuo Frost Composite"
@@ -120,7 +118,7 @@ public final class MetalFrostRenderer {
 
         let copyDescriptor = MTLRenderPipelineDescriptor()
         copyDescriptor.label = "MacDuo Picture Copy"
-        copyDescriptor.vertexFunction = vertexFunction
+        copyDescriptor.vertexFunction = flatVertexFunction
         copyDescriptor.fragmentFunction = copyFunction
         copyDescriptor.colorAttachments[0].pixelFormat = Self.capturePixelFormat
         copyPipeline = try device.makeRenderPipelineState(descriptor: copyDescriptor)
@@ -139,14 +137,16 @@ public final class MetalFrostRenderer {
     ///
     /// - Parameters:
     ///   - pixelBuffer: the captured frame of the built-in display.
-    ///   - progress: 0 = the picture standing at 90°, 1 = fully folded.
-    ///   - settings: current look/anchor configuration.
+    ///   - progress: 强度，0 = 画面正对，1 = 拉满。
+    ///   - mirror: 展开侧镜像：true 时顶端钉住、底端收窄。
+    ///   - settings: the trapezoid, the blur ramp and the optional extras.
     ///   - viewSize: drawable size in pixels.
-    ///   - displayScale: drawable pixels per display point, so that the blur
-    ///     radius stays the same physical size on any display.
+    ///   - displayScale: drawable pixels per display point, so the blur radius
+    ///     stays the same physical size on any display.
     @discardableResult
     public func render(pixelBuffer: CVPixelBuffer,
                        progress: Double,
+                       mirror: Bool = false,
                        settings: FrostSettings,
                        drawable: CAMetalDrawable,
                        viewSize: CGSize,
@@ -154,6 +154,7 @@ public final class MetalFrostRenderer {
         let ok = render(into: drawable.texture,
                         pixelBuffer: pixelBuffer,
                         progress: progress,
+                        mirror: mirror,
                         settings: settings,
                         pixelSize: viewSize,
                         displayScale: displayScale)
@@ -166,6 +167,7 @@ public final class MetalFrostRenderer {
     @discardableResult
     public func renderOffscreen(pixelBuffer: CVPixelBuffer,
                                 progress: Double,
+                                mirror: Bool = false,
                                 settings: FrostSettings,
                                 target: MTLTexture,
                                 displayScale: CGFloat = MetalFrostRenderer.defaultDisplayScale) -> Bool {
@@ -177,6 +179,7 @@ public final class MetalFrostRenderer {
         return render(into: target,
                       pixelBuffer: pixelBuffer,
                       progress: progress,
+                      mirror: mirror,
                       settings: settings,
                       pixelSize: size,
                       displayScale: displayScale)
@@ -191,6 +194,7 @@ public final class MetalFrostRenderer {
     private func render(into target: MTLTexture,
                         pixelBuffer: CVPixelBuffer,
                         progress: Double,
+                        mirror: Bool,
                         settings: FrostSettings,
                         pixelSize: CGSize,
                         displayScale: CGFloat) -> Bool {
@@ -205,6 +209,7 @@ public final class MetalFrostRenderer {
         }
 
         var uniforms = makeUniforms(progress: progress,
+                                    mirror: mirror,
                                     settings: settings,
                                     pictureWidth: width,
                                     pictureHeight: height,
@@ -223,20 +228,22 @@ public final class MetalFrostRenderer {
         if let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: copyDescriptor) {
             encoder.label = "MacDuo Picture Copy"
             encoder.setRenderPipelineState(copyPipeline)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<FrostUniforms>.stride, index: 0)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<FrostUniforms>.stride, index: 0)
             encoder.setFragmentTexture(sourceTexture, index: 0)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             encoder.endEncoding()
         }
 
-        // Pass 2: prefiltered levels for the blur taps to read from.
+        // Pass 2: the prefiltered levels the blur taps read from.
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "MacDuo Mip Chain"
             blit.generateMipmaps(for: picture)
             blit.endEncoding()
         }
 
-        // Pass 3: the fold itself — blur ramp plus shadow ramp.
+        // Pass 3: the trapezoid, the blur ramp and — everywhere the trapezoid is
+        // not — black, which is what the clear leaves behind.
         let descriptor = MTLRenderPassDescriptor()
         descriptor.colorAttachments[0].texture = target
         descriptor.colorAttachments[0].loadAction = .clear
@@ -290,27 +297,30 @@ public final class MetalFrostRenderer {
     // MARK: - Internals
 
     private func makeUniforms(progress: Double,
+                              mirror: Bool,
                               settings: FrostSettings,
                               pictureWidth: Int,
                               pictureHeight: Int,
                               displayScale: CGFloat) -> FrostUniforms {
         var uniforms = FrostUniforms()
 
+        let strength = min(max(progress, 0), 1)
         uniforms.pictureSize = SIMD2(Float(max(pictureWidth, 1)), Float(max(pictureHeight, 1)))
-        uniforms.progress = Float(min(max(progress, 0), 1))
+        uniforms.progress = Float(strength)
         // The radius is authored in points so the effect looks the same on any
         // display; the picture is in pixels.
-        uniforms.blurRadiusPx = Float(max(settings.blurRadiusPoints, 0) * Double(max(displayScale, 0.1)))
-        uniforms.falloff = Float(min(max(settings.rampFalloff, 0.05), 4))
-        uniforms.hingeClear = Float(min(max(settings.hingeClearFraction, 0), 0.8))
-        uniforms.darkenStart = Float(min(max(settings.darkeningStart, 0), 0.9))
+        uniforms.blurRadiusPx = Float(max(settings.maxBlurRadius, 0) * Double(max(displayScale, 0.1)))
+        uniforms.falloff = Float(min(max(settings.blurFalloff, 0.05), 4))
         uniforms.darkenGain = Float(min(max(settings.farDarkening, 0), 4))
         uniforms.frostOpacity = Float(min(max(settings.frostOpacity, 0), 1))
         uniforms.frostSaturation = Float(min(max(settings.frostSaturation, 0), 1))
-        // Screen heights, so the eye is described the same way the reference
-        // describes its camera.
-        uniforms.eyeDistance = Float(min(max(settings.eyeDistance, 0.5), 12))
-        uniforms.eyeHeight = Float(min(max(settings.eyeHeight, -1), 3))
+
+        // The trapezoid: the bottom edge of the picture is pinned to the bottom
+        // edge of the display, and the top comes in as the lid folds. 1/(1+amount)
+        // keeps the change gentle at first and obvious by the time the lid is down.
+        let narrowing = max(settings.topNarrowing, 0)
+        uniforms.topScale = Float(1.0 / (1.0 + narrowing * strength))
+        uniforms.anchor = mirror ? 1 : 0
         return uniforms
     }
 

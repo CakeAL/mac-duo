@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import OSLog
 import ScreenCaptureKit
 import CoreGraphics
 import CoreMedia
@@ -35,9 +36,6 @@ public enum CaptureEngineError: LocalizedError {
 @Observable
 public final class CaptureEngine: NSObject {
 
-    public override init() { super.init() }
-
-
     public private(set) var isRunning = false
     public private(set) var lastError: String?
     public private(set) var displaySize = CGSize.zero
@@ -57,6 +55,37 @@ public final class CaptureEngine: NSObject {
         CGPreflightScreenCaptureAccess()
     }
 
+    private static let logger = Logger(subsystem: "local.macduo.app", category: "capture")
+
+    /// 构造"抓内建显示器、并把自己整个排除掉"的过滤器。
+    ///
+    /// 排除必须按**应用**做，不能按窗口列：覆盖窗口铺满整屏、显示的就是捕获画面，
+    /// 只要它被拍进去一帧，这一帧就会成为下一帧的输入，模糊与压暗逐帧累积，屏幕上
+    /// 会出现一层流动的糊、拖影和整体发灰——也就是那个"液体效果"。而覆盖窗口在效果
+    /// 为零时是 orderOut 的，用 `onScreenWindowsOnly: true` 根本列不到它。
+    ///
+    /// 单独抽出来，是为了让验证程序能对同一个过滤器核对这件事。
+    public static func makeBuiltInFilter() async throws -> SCContentFilter {
+        guard let displayID = DisplayResolver.builtInDisplayID else {
+            throw CaptureEngineError.noBuiltInDisplay
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(false,
+                                                                          onScreenWindowsOnly: false)
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            throw CaptureEngineError.noBuiltInDisplay
+        }
+        let ownProcessID = ProcessInfo.processInfo.processIdentifier
+        let ownApplication = content.applications.first { $0.processID == ownProcessID }
+        if ownApplication == nil {
+            logger.error("自己的进程不在可共享内容里，覆盖窗口可能被拍进捕获造成反馈")
+        }
+        return SCContentFilter(display: display,
+                               excludingApplications: ownApplication.map { [$0] } ?? [],
+                               exceptingWindows: [])
+    }
+
+    public override init() { super.init() }
+
     public static func requestScreenRecordingPermission() {
         CGRequestScreenCaptureAccess()
     }
@@ -74,21 +103,7 @@ public final class CaptureEngine: NSObject {
                 throw CaptureEngineError.noBuiltInDisplay
             }
 
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false,
-                onScreenWindowsOnly: true
-            )
-
-            guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
-                throw CaptureEngineError.noBuiltInDisplay
-            }
-
-            // Keep our own overlay out of the capture, otherwise it feeds back
-            // on itself. Everything else is included, so normal windows are.
-            let ownWindows = content.windows.filter { window in
-                window.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier
-            }
-            let filter = SCContentFilter(display: display, excludingWindows: ownWindows)
+            let filter = try await Self.makeBuiltInFilter()
 
             let configuration = SCStreamConfiguration()
             let pixelWidth = CGDisplayPixelsWide(displayID)
@@ -97,8 +112,16 @@ public final class CaptureEngine: NSObject {
             configuration.width = Int(pixelWidth)
             configuration.height = Int(pixelHeight)
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            // sRGB, explicitly, and the overlay tags its layer with the same
+            // space, so the captured pixels reach the screen unchanged.
+            configuration.colorSpaceName = CGColorSpace.sRGB
+            // The cursor is drawn by the system on top of everything, so it must
+            // not also be inside the captured picture: that would show up as a
+            // second, lagging cursor.
             configuration.showsCursor = false
-            configuration.queueDepth = 5
+            // Shallow queue: every buffered frame is a frame of lag between the
+            // screen and the picture the overlay shows.
+            configuration.queueDepth = 3
             configuration.scalesToFit = true
             configuration.preservesAspectRatio = true
 

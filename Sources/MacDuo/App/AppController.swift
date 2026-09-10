@@ -211,7 +211,14 @@ final class AppController {
             // overlay would blank the display for the first frames.
             if capture.isRunning {
                 previewPhase += elapsed
-                target = Self.previewProgress(at: previewPhase)
+                if previewPhase >= Self.previewCycle {
+                    // One fold and back, then hand the screen back on its own: a
+                    // preview that loops forever is a screen that never stops
+                    // rearranging itself.
+                    stopPreview()
+                } else {
+                    target = Self.previewProgress(at: previewPhase)
+                }
             } else {
                 target = 0
             }
@@ -225,10 +232,9 @@ final class AppController {
         if abs(target - progress) < 0.0008 { progress = target }
 
         isFrosting = progress > 0.001
-        overlay.update(progress: progress)
+        overlay.update(progress: progress, mirror: settings.mirror)
 
-        // A little above the activation angle, so the first frame is already
-        // there by the time the effect actually becomes visible.
+        // 只要盖角压到生效角度附近，效果就可能出现，捕获就开着。
         let needsCapture = isPreviewing || raw < settings.activationAngle + 10
         manageCaptureLifecycle(needsCapture: needsCapture)
     }
