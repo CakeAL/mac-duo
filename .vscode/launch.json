@@ -1,0 +1,44 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-duo}",
+            "name": "Debug MacDuoProbe",
+            "target": "MacDuoProbe",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MacDuoProbe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-duo}",
+            "name": "Release MacDuoProbe",
+            "target": "MacDuoProbe",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MacDuoProbe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-duo}",
+            "name": "Debug MacDuo",
+            "target": "MacDuo",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MacDuo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:mac-duo}",
+            "name": "Release MacDuo",
+            "target": "MacDuo",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MacDuo"
+        }
+    ]
+}

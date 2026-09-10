@@ -1,0 +1,5 @@
+.scratch/
+.build/
+dist/
+*.ips
+.DS_Store
