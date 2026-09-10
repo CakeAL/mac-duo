@@ -63,8 +63,8 @@ struct MenuBarPanel: View {
             Toggle("启用磨砂效果", isOn: $settings.isEnabled)
 
             LabeledSlider(
-                title: "最强模糊",
-                value: $settings.maxBlurPoints,
+                title: "远端最强模糊",
+                value: $settings.blurRadiusPoints,
                 range: 0...200,
                 format: "%.0f pt"
             )
@@ -80,9 +80,32 @@ struct MenuBarPanel: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if !CaptureEngine.hasScreenRecordingPermission {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("缺少屏幕录制权限：合盖时不会出现任何效果。授权后需要重新启动一次本应用。")
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Button("打开屏幕录制设置") {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+
             Button("打开设置…") {
                 openWindow(id: MacDuoSceneID.settings)
                 NSApp.activate(ignoringOtherApps: true)
+            }
+
+            Button(controller.isPreviewing ? "停止开合预览" : "预览开合动画") {
+                if !controller.isPreviewing,
+                   !CaptureEngine.hasScreenRecordingPermission {
+                    CaptureEngine.requestScreenRecordingPermission()
+                }
+                controller.togglePreview()
             }
 
             if controller.capture.isRunning {

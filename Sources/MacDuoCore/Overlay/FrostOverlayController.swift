@@ -119,20 +119,29 @@ public final class FrostOverlayController: NSObject {
 
     // MARK: - Intensity
 
-    /// - Parameter intensity: 0 hides the overlay entirely, 1 is fully frosted.
-    public func update(intensity: Double) {
+    /// - Parameter progress: 0 hides the overlay entirely, 1 is fully folded.
+    public func update(progress: Double) {
         guard isRunning else { return }
-        let clamped = min(max(intensity, 0), 1)
+        let clamped = min(max(progress, 0), 1)
         guard abs(clamped - currentIntensity) > 0.0008 else { return }
         currentIntensity = clamped
         needsRedraw = true
 
         if clamped <= 0 {
             window?.orderOut(nil)
-        } else if window?.isVisible != true {
-            window?.orderFrontRegardless()
+        } else {
+            presentIfPossible()
         }
         metalView?.setNeedsDisplay(metalView?.bounds ?? .zero)
+    }
+
+    /// Shows the overlay, but only once there is a captured frame to paint.
+    ///
+    /// Ordering it in earlier would put an opaque black window over the desktop
+    /// for the frame or two it takes the stream to deliver its first picture.
+    private func presentIfPossible() {
+        guard pendingFrame != nil, window?.isVisible != true else { return }
+        window?.orderFrontRegardless()
     }
 
     // MARK: - Frames
@@ -141,6 +150,7 @@ public final class FrostOverlayController: NSObject {
         guard isRunning, currentIntensity > 0 else { return }
         pendingFrame = frame
         needsRedraw = true
+        presentIfPossible()
         metalView?.setNeedsDisplay(metalView?.bounds ?? .zero)
     }
 
@@ -206,12 +216,19 @@ extension FrostOverlayController: MTKViewDelegate {
 
             let settings = self.settings
 
+            // The blur radius is authored in points, the picture is in pixels.
+            let pointWidth = max(window.frame.width, 1)
+            let displayScale = window.backingScaleFactor > 0
+                ? window.backingScaleFactor
+                : view.drawableSize.width / pointWidth
+
             let rendered = renderer.render(
                 pixelBuffer: frame,
-                intensity: currentIntensity,
+                progress: currentIntensity,
                 settings: settings,
                 drawable: drawable,
-                viewSize: view.drawableSize
+                viewSize: view.drawableSize,
+                displayScale: displayScale
             )
 
             if rendered {

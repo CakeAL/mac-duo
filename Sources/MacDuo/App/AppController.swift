@@ -23,9 +23,13 @@ final class AppController {
 
     /// Latest lid angle after calibration.
     private(set) var angle: Double = 110
-    /// 0 = clear screen, 1 = fully frosted.
-    private(set) var intensity: Double = 0
+    /// 0 = the picture standing at 90°, 1 = fully folded.
+    private(set) var progress: Double = 0
     private(set) var isFrosting = false
+
+    /// True while the fold animation is being replayed on screen from the menu,
+    /// without moving the lid.
+    private(set) var isPreviewing = false
 
     /// True when the user asked for capture by hand from the menu.
     private(set) var isCapturePinned = false
@@ -34,9 +38,17 @@ final class AppController {
     /// wiggle around the threshold does not thrash the stream.
     private static let idleGrace: TimeInterval = 8
 
+    /// One cycle of the preview animation, shaped like the folding reference:
+    /// open, close, held closed, open again.
+    private static let previewCycle: TimeInterval = 8.6
+    private static let previewHold: TimeInterval = 1.2
+    private static let previewMove: TimeInterval = 3.1
+
     @ObservationIgnored private static let logger = Logger(subsystem: "local.macduo.app", category: "controller")
 
     @ObservationIgnored private var lastActiveTime: TimeInterval = 0
+    @ObservationIgnored private var lastTick: TimeInterval = 0
+    @ObservationIgnored private var previewPhase: TimeInterval = 0
     @ObservationIgnored private var isStartingCapture = false
     @ObservationIgnored private var tickTask: Task<Void, Never>?
 
@@ -143,19 +155,81 @@ final class AppController {
 
     // MARK: - Effect state
 
+    /// Replays the fold on the built-in display, so the effect can be seen
+    /// without folding the machine. Capture has to be running for it: the
+    /// overlay shows the captured picture, not an invented one.
+    func startPreview() {
+        guard !isPreviewing else { return }
+        isPreviewing = true
+        previewPhase = 0
+        Self.logger.info("fold preview started")
+    }
+
+    func stopPreview() {
+        guard isPreviewing else { return }
+        isPreviewing = false
+        previewPhase = 0
+        Self.logger.info("fold preview stopped")
+    }
+
+    func togglePreview() {
+        isPreviewing ? stopPreview() : startPreview()
+    }
+
+    /// Fold amount of the preview animation at a point in its cycle: open,
+    /// shut, held, open again — a cosine at each end so the motion has no
+    /// corners, the same shape as the reference's play button.
+    static func previewProgress(at phase: TimeInterval) -> Double {
+        let cycle = previewCycle
+        let t = phase.truncatingRemainder(dividingBy: cycle)
+        let hold = previewHold
+        let move = previewMove
+        switch t {
+        case ..<hold:
+            return 0
+        case ..<(hold + move):
+            return (1 - cos((t - hold) / move * .pi)) / 2
+        case ..<(hold * 2 + move):
+            return 1
+        default:
+            return (1 + cos((t - hold * 2 - move) / move * .pi)) / 2
+        }
+    }
+
     private func refresh() {
         settings.rawAngle = sensor.angle
         let raw = (sensor.angle + settings.angleOffset) * settings.angleScale
         angle = raw
 
-        let value = settings.intensity(for: raw)
-        intensity = value
-        isFrosting = value > 0.001
-        overlay.update(intensity: value)
+        let now = CACurrentMediaTime()
+        let elapsed = lastTick > 0 ? min(max(now - lastTick, 0), 0.25) : 0
+        lastTick = now
+
+        var target = settings.progress(for: raw)
+        if isPreviewing {
+            // Hold the animation until there is a picture to fold, otherwise the
+            // overlay would blank the display for the first frames.
+            if capture.isRunning {
+                previewPhase += elapsed
+                target = Self.previewProgress(at: previewPhase)
+            } else {
+                target = 0
+            }
+        }
+
+        // The sensor is already smoothed; this second, time-based ease is what
+        // turns a quick flick of the lid into one continuous fold animation.
+        let timeConstant = max(settings.responseSmoothing, 0.001)
+        let alpha = elapsed > 0 ? 1 - exp(-elapsed / timeConstant) : 1
+        progress += (target - progress) * alpha
+        if abs(target - progress) < 0.0008 { progress = target }
+
+        isFrosting = progress > 0.001
+        overlay.update(progress: progress)
 
         // A little above the activation angle, so the first frame is already
         // there by the time the effect actually becomes visible.
-        let needsCapture = raw < settings.activationAngle + 10
+        let needsCapture = isPreviewing || raw < settings.activationAngle + 10
         manageCaptureLifecycle(needsCapture: needsCapture)
     }
 }

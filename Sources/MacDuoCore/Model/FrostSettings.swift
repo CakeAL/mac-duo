@@ -2,8 +2,10 @@
 //  FrostSettings.swift
 //  MacDuo
 //
-//  The knobs that shape the fold illusion and the frosted glass on top of it,
-//  persisted to UserDefaults.
+//  The knobs behind the fold illusion, persisted to UserDefaults.
+//
+//  None of them move the picture: the effect is a blur ramp plus a shadow ramp
+//  laid over a picture that stays exactly where it would be at 90°.
 //
 
 import Foundation
@@ -15,48 +17,74 @@ public final class FrostSettings {
 
     // MARK: - Angle behaviour
 
-    /// The effect is completely off at or above this angle.
+    /// The effect is completely off at or above this angle. 90° is the
+    /// reference's own starting point: its slider runs the fold from flat (0) to
+    /// shut (1), which is exactly 90° down to 0° on a laptop lid.
     public var activationAngle: Double { didSet { persist(\.activationAngle, key: "activationAngle") } }
-    /// The effect reaches full strength at or below this angle.
+    /// The effect reaches full strength at or below this angle; 0 keeps the fold
+    /// and the lid angle in step the whole way down.
     public var saturationAngle: Double { didSet { persist(\.saturationAngle, key: "saturationAngle") } }
     /// Exponent applied to the normalized closing progress; >1 keeps the effect subtle longer.
     public var responseCurve: Double { didSet { persist(\.responseCurve, key: "responseCurve") } }
+    /// Time constant, in seconds, of the animated approach to the target strength.
+    /// A fast lid movement therefore still reads as one continuous fold.
+    public var responseSmoothing: Double { didSet { persist(\.responseSmoothing, key: "responseSmoothing") } }
 
-    // MARK: - Fold geometry
+    // MARK: - The ramp
 
-    /// Trapezoid amount at full strength.
+    /// Blur radius, in points, at the far edge (the top of the display) at full
+    /// strength. The hinge edge stays at zero. 72 is the reference's number.
+    public var blurRadiusPoints: Double { didSet { persist(\.blurRadiusPoints, key: "blurRadiusPoints") } }
+    /// Shape of the ramp from the hinge to the far edge.
     ///
-    /// The picture is a flat panel hinged along the bottom edge of the display.
-    /// `0` leaves it standing at 90°, i.e. a plain rectangle. A value of `t`
-    /// makes the top edge `1/(1+t)` as wide as the hinge edge; the sides slant
-    /// straight in and the rows bunch up as they recede, and whatever the panel
-    /// no longer covers shows the surface behind it.
-    public var trapezoidAmount: Double { didSet { persist(\.trapezoidAmount, key: "trapezoidAmount") } }
+    /// `1` is a straight ramp. The reference look is `1.35`: the near half of the
+    /// picture stays legible and the softening bunches up towards the far edge.
+    public var rampFalloff: Double { didSet { persist(\.rampFalloff, key: "rampFalloff") } }
+    /// Fraction of the height at the hinge that is left perfectly sharp.
+    public var hingeClearFraction: Double { didSet { persist(\.hingeClearFraction, key: "hingeClearFraction") } }
 
-    // MARK: - Frost
+    // MARK: - Viewer
 
-    /// Blur radius in display points at the top edge, where the frost is heaviest.
-    public var maxBlurPoints: Double { didSet { persist(\.maxBlurPoints, key: "maxBlurPoints") } }
-    /// Blur radius at the hinge edge, so the bottom of the picture stays legible.
-    public var minBlurPoints: Double { didSet { persist(\.minBlurPoints, key: "minBlurPoints") } }
-    /// Fraction of the panel height at the hinge that is left (almost) clear.
-    public var nearClearFraction: Double { didSet { persist(\.nearClearFraction, key: "nearClearFraction") } }
-    /// 0 = crisp stacked blur (glass), 1 = soft transition (heavy frost).
-    public var frostSoftness: Double { didSet { persist(\.frostSoftness, key: "frostSoftness") } }
-    /// Strength of the milky frosted-glass wash, 0...1.
+    /// Where the viewer's eye is, in units of screen heights.
+    ///
+    /// The fold is projected from this eye, which is what compresses the picture
+    /// towards the hinge as the lid goes down. The reference puts its camera 40
+    /// units from a screen about 11 units tall, i.e. about 3.6 screens; a person
+    /// about 50 cm from a 22 cm-tall screen is about 2.3 screens away. Farther
+    /// away = flatter compression, closer = stronger.
+    public var eyeDistance: Double { didSet { persist(\.eyeDistance, key: "eyeDistance") } }
+    /// Height of the eye above the hinge, also in screen heights: 0.5 is dead
+    /// centre, higher values mean you are looking down at the screen.
+    public var eyeHeight: Double { didSet { persist(\.eyeHeight, key: "eyeHeight") } }
+
+    // MARK: - Shadow
+
+    /// How hard the far edge falls into the dark.
+    ///
+    /// `2.0` is the reference value — `color *= 1 - min(1, effect * 2)` — and is
+    /// the default here: at the far edge the shadow reaches full strength once
+    /// the fold is past halfway. Lower values keep more of the picture visible.
+    public var farDarkening: Double { didSet { persist(\.farDarkening, key: "farDarkening") } }
+    /// Where the shadow begins along the ramp, 0 = at the hinge, 1 = at the far edge.
+    public var darkeningStart: Double { didSet { persist(\.darkeningStart, key: "darkeningStart") } }
+
+    // MARK: - Glass
+
+    /// Strength of the milky wash that sells the frosted-glass surface.
+    ///
+    /// Off by default: the reference has no such wash, it only blurs and
+    /// darkens. Raise it for a more "glass" and less "out of focus" feel.
     public var frostOpacity: Double { didSet { persist(\.frostOpacity, key: "frostOpacity") } }
     /// Colour kept in the frosted area, 0 (greyscale) ... 1 (untouched).
+    ///
+    /// 1 by default, again matching the reference, which keeps every colour.
     public var frostSaturation: Double { didSet { persist(\.frostSaturation, key: "frostSaturation") } }
-    /// Dim the frosted area slightly, which reads as glass over a dark room.
-    public var frostDim: Double { didSet { persist(\.frostDim, key: "frostDim") } }
-    /// How dark the surface behind the tipped panel is, 0...1.
-    public var backgroundDim: Double { didSet { persist(\.backgroundDim, key: "backgroundDim") } }
 
     // MARK: - Behaviour
 
     /// Master switch for the whole effect.
-    public var isEnabled: Bool { didSet { UserDefaults.standard.set(isEnabled, forKey: "isEnabled") } }
-    public var showInMenuBar: Bool { didSet { UserDefaults.standard.set(showInMenuBar, forKey: "showInMenuBar") } }
+    public var isEnabled: Bool { didSet { store.set(isEnabled, forKey: "isEnabled") } }
+    public var showInMenuBar: Bool { didSet { store.set(showInMenuBar, forKey: "showInMenuBar") } }
 
     // MARK: - Calibration
 
@@ -68,22 +96,44 @@ public final class FrostSettings {
     /// Raw sensor value as it comes off the HID report, before calibration.
     public var rawAngle: Double = 0
 
+    /// Where the values are read from and written back to. The verification
+    /// harness passes its own suite so its experiments never touch the settings
+    /// of the installed app.
+    @ObservationIgnored private let store: UserDefaults
+
     // MARK: - Init
 
-    public init(defaults: UserDefaults = .standard) {
+    /// Bumped whenever the effect changes shape.
+    ///
+    /// A stored value from an older version describes knobs that no longer mean
+    /// the same thing — the trapezoid build's leftovers, for instance, or a frost
+    /// wash dialled up while looking at a different effect entirely. On a version
+    /// change the stored values are dropped so the saved settings always describe
+    /// the effect that is actually running.
+    public static let settingsVersion = 3
+
+    public init(defaults store: UserDefaults = .standard) {
+        self.store = store
+        if store.integer(forKey: "settingsVersion") != Self.settingsVersion {
+            Self.clearStoredValues(in: store)
+            store.set(Self.settingsVersion, forKey: "settingsVersion")
+        }
+
+        let defaults = store
         defaults.register(defaults: [
             "activationAngle": 90.0,
-            "saturationAngle": 15.0,
+            "saturationAngle": 0.0,
             "responseCurve": 1.0,
-            "trapezoidAmount": 0.24,
-            "maxBlurPoints": 90.0,
-            "minBlurPoints": 2.0,
-            "nearClearFraction": 0.18,
-            "frostSoftness": 0.45,
-            "frostOpacity": 0.14,
-            "frostSaturation": 0.55,
-            "frostDim": 0.06,
-            "backgroundDim": 0.55,
+            "responseSmoothing": 0.12,
+            "blurRadiusPoints": 72.0,
+            "rampFalloff": 1.35,
+            "hingeClearFraction": 0.0,
+            "farDarkening": 2.0,
+            "darkeningStart": 0.2,
+            "frostOpacity": 0.0,
+            "frostSaturation": 1.0,
+            "eyeDistance": 2.5,
+            "eyeHeight": 0.5,
             "angleOffset": 0.0,
             "angleScale": 1.0,
             "isEnabled": true,
@@ -93,15 +143,16 @@ public final class FrostSettings {
         activationAngle = defaults.double(forKey: "activationAngle")
         saturationAngle = defaults.double(forKey: "saturationAngle")
         responseCurve = defaults.double(forKey: "responseCurve")
-        trapezoidAmount = defaults.double(forKey: "trapezoidAmount")
-        maxBlurPoints = defaults.double(forKey: "maxBlurPoints")
-        minBlurPoints = defaults.double(forKey: "minBlurPoints")
-        nearClearFraction = defaults.double(forKey: "nearClearFraction")
-        frostSoftness = defaults.double(forKey: "frostSoftness")
+        responseSmoothing = defaults.double(forKey: "responseSmoothing")
+        blurRadiusPoints = defaults.double(forKey: "blurRadiusPoints")
+        rampFalloff = defaults.double(forKey: "rampFalloff")
+        hingeClearFraction = defaults.double(forKey: "hingeClearFraction")
+        farDarkening = defaults.double(forKey: "farDarkening")
+        darkeningStart = defaults.double(forKey: "darkeningStart")
         frostOpacity = defaults.double(forKey: "frostOpacity")
         frostSaturation = defaults.double(forKey: "frostSaturation")
-        frostDim = defaults.double(forKey: "frostDim")
-        backgroundDim = defaults.double(forKey: "backgroundDim")
+        eyeDistance = defaults.double(forKey: "eyeDistance")
+        eyeHeight = defaults.double(forKey: "eyeHeight")
         angleOffset = defaults.double(forKey: "angleOffset")
         angleScale = defaults.double(forKey: "angleScale")
         isEnabled = defaults.bool(forKey: "isEnabled")
@@ -110,24 +161,36 @@ public final class FrostSettings {
 
     // MARK: - Derived values
 
-    /// Width of the top edge relative to the hinge edge at full strength.
-    public var topToBottomWidthRatio: Double {
-        1.0 / (1.0 + max(trapezoidAmount, 0))
-    }
-
-    /// 0 = effect fully off, 1 = fully frosted.
-    public func intensity(for angle: Double) -> Double {
+    /// The reference's `progress` — the fold amount its slider sets — read off the
+    /// lid angle instead. 0 = the picture standing at 90°, 1 = fully folded.
+    public func progress(for angle: Double) -> Double {
         guard isEnabled else { return 0 }
         let span = max(activationAngle - saturationAngle, 0.001)
-        let progress = (activationAngle - angle) / span
-        let clamped = min(max(progress, 0), 1)
+        let raw = (activationAngle - angle) / span
+        let clamped = min(max(raw, 0), 1)
         guard clamped > 0 else { return 0 }
         return pow(clamped, max(responseCurve, 0.05))
     }
 
     // MARK: - Persistence
 
+    /// Every key this class owns. The window frame is deliberately left alone.
+    private static let storedKeys = [
+        "activationAngle", "saturationAngle", "responseCurve", "responseSmoothing",
+        "blurRadiusPoints", "rampFalloff", "hingeClearFraction", "farDarkening",
+        "darkeningStart", "frostOpacity", "frostSaturation", "eyeDistance",
+        "eyeHeight", "angleOffset", "angleScale", "isEnabled", "showInMenuBar",
+        // Keys from earlier shapes of the effect, so a stale file cannot confuse
+        // anything that reads the domain by hand.
+        "trapezoidAmount", "backgroundDim", "maxBlurPoints", "minBlurPoints",
+        "nearClearFraction", "frostSoftness", "frostDim",
+    ]
+
+    private static func clearStoredValues(in store: UserDefaults) {
+        for key in storedKeys { store.removeObject(forKey: key) }
+    }
+
     private func persist(_ keyPath: KeyPath<FrostSettings, Double>, key: String) {
-        UserDefaults.standard.set(self[keyPath: keyPath], forKey: key)
+        store.set(self[keyPath: keyPath], forKey: key)
     }
 }

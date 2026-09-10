@@ -66,52 +66,112 @@ private struct EffectPane: View {
         return VStack(alignment: .leading, spacing: 18) {
             FoldPreview(controller: controller)
 
-            SectionCard("折叠形变（画面仍在 90° 的位置）") {
+            SectionCard("折叠几何（从你的位置看这块面板）") {
                 LabeledSlider(
-                    title: "梯形倾斜量",
-                    value: $settings.trapezoidAmount,
-                    range: 0...0.45,
-                    format: "%.2f"
+                    title: "观察距离",
+                    value: $settings.eyeDistance,
+                    range: 1...8,
+                    format: "%.2f 屏高"
                 )
-                Text(String(format: "最强时顶端宽度 = 底端的 %.0f%%。数值 0 时画面就是普通矩形。",
-                            100 * settings.topToBottomWidthRatio))
+                Text("眼睛离屏幕有多远，单位是屏幕高度。越近，画面朝铰链方向压得越狠；参考实现里相机约在 3.6 屏高之外。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
                 LabeledSlider(
-                    title: "画面后方的暗度",
-                    value: $settings.backgroundDim,
-                    range: 0...1,
-                    format: "%.2f"
+                    title: "眼睛高度",
+                    value: $settings.eyeHeight,
+                    range: 0...2,
+                    format: "%.2f 屏高"
                 )
-                Text("梯形之外露出来的部分，用屏幕边缘的颜色延续并压暗，代表折叠后露出的背景。")
+                Text("眼睛高于铰链多少（0.5 = 屏幕正中）。坐得高一点，画面被压得轻一点。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
-            SectionCard("毛玻璃（上强下弱）") {
-                LabeledSlider(title: "顶端最强模糊", value: $settings.maxBlurPoints, range: 0...220, format: "%.0f pt")
-                LabeledSlider(title: "底端基础模糊", value: $settings.minBlurPoints, range: 0...40, format: "%.1f pt")
+            SectionCard("渐进模糊（沿面板从铰链到远端）") {
                 LabeledSlider(
-                    title: "底部保持清晰的高度",
-                    value: $settings.nearClearFraction,
+                    title: "远端最强模糊",
+                    value: $settings.blurRadiusPoints,
+                    range: 0...200,
+                    format: "%.0f pt"
+                )
+                Text("铰链一侧恒为 0 pt，越靠近面板远端越糊。72 是参考实现的取值，约等于画面宽度的 4.5%。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                LabeledSlider(
+                    title: "渐变曲线",
+                    value: $settings.rampFalloff,
+                    range: 0.5...3,
+                    format: "%.2f"
+                )
+                Text("1 = 线性；1.35（参考实现）让靠近铰链的一半保持可读，模糊集中在远端那一段。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                LabeledSlider(
+                    title: "铰链侧保持清晰",
+                    value: $settings.hingeClearFraction,
+                    range: 0...0.4,
+                    format: "%.2f"
+                )
+                Text("从铰链算起这一比例的面板高度完全不糊。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            SectionCard("远端压暗") {
+                LabeledSlider(
+                    title: "压暗强度",
+                    value: $settings.farDarkening,
+                    range: 0...2.5,
+                    format: "%.2f"
+                )
+                Text("2.0 是参考实现的取值：合到一半以后，最远端就已经全黑。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                LabeledSlider(
+                    title: "压暗起始位置",
+                    value: $settings.darkeningStart,
                     range: 0...0.6,
                     format: "%.2f"
                 )
-                Text("从铰链这一侧算起，这一段高度基本清晰，往上才开始起雾。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-
-                LabeledSlider(title: "层次融合", value: $settings.frostSoftness, range: 0...1, format: "%.2f")
-                Text("0 = 三层模糊分明，像叠起来的玻璃；1 = 融成一条连续渐变。")
+                Text("0 = 从铰链就开始压暗，0.2 表示前 20% 完全不受影响。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
-            SectionCard("质感") {
-                LabeledSlider(title: "白雾浓度", value: $settings.frostOpacity, range: 0...0.5, format: "%.2f")
+            SectionCard("毛玻璃质感") {
+                LabeledSlider(title: "白雾浓度", value: $settings.frostOpacity, range: 0...0.4, format: "%.2f")
                 LabeledSlider(title: "保留色彩", value: $settings.frostSaturation, range: 0...1, format: "%.2f")
-                LabeledSlider(title: "压暗", value: $settings.frostDim, range: 0...0.4, format: "%.2f")
+                Text("只在已经糊掉的地方叠加，铰链一侧不受影响。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            SectionCard("开合动画") {
+                LabeledSlider(
+                    title: "平滑时间",
+                    value: $settings.responseSmoothing,
+                    range: 0...0.6,
+                    format: "%.2f s"
+                )
+                Text("角度变化到画面跟上之间的时间常数：越大，合盖的动作越像一段连续的折叠动画。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button(controller.isPreviewing ? "停止预览" : "预览开合动画") {
+                        controller.togglePreview()
+                    }
+                    if !controller.capture.isRunning {
+                        Text("预览需要画面捕获权限")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
             }
         }
     }
@@ -138,7 +198,7 @@ private struct AnglePane: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                 } else {
-                    Text("角度从 \(settings.activationAngle, format: .number.precision(.fractionLength(0)))° 合到 \(settings.saturationAngle, format: .number.precision(.fractionLength(0)))° 的过程中，倾斜与磨砂由无到最强。")
+                    Text("角度从 \(settings.activationAngle, format: .number.precision(.fractionLength(0)))° 合到 \(settings.saturationAngle, format: .number.precision(.fractionLength(0)))° 的过程中，模糊与压暗由无到最强。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -157,13 +217,48 @@ private struct AnglePane: View {
             SectionCard("当前状态") {
                 ReadoutRow(label: "原始读数", value: String(format: "%.1f°", settings.rawAngle))
                 ReadoutRow(label: "校准后角度", value: String(format: "%.1f°", controller.angle))
-                ReadoutRow(label: "效果强度", value: String(format: "%.2f", controller.intensity))
+                ReadoutRow(label: "折叠进度", value: String(format: "%.2f", controller.progress))
                 ReadoutRow(
-                    label: "当前梯形比例",
-                    value: String(format: "%.0f%%", 100 / (1 + settings.trapezoidAmount * controller.intensity))
+                    label: "远端模糊",
+                    value: String(format: "%.0f pt",
+                                  settings.blurRadiusPoints * Self.eased(controller.progress))
+                )
+                ReadoutRow(
+                    label: "远端压暗",
+                    value: String(format: "%.0f%%",
+                                  min(1, Self.eased(controller.progress) * settings.farDarkening) * 100)
+                )
+                ReadoutRow(
+                    label: "面板可见高度",
+                    value: String(format: "%.0f%%", 100 * Self.visiblePanelFraction(settings: settings,
+                                                                                     progress: controller.progress))
                 )
             }
         }
+    }
+
+    /// `motion` in the shader: the fold eased into its effect.
+    static func eased(_ progress: Double) -> Double {
+        let p = min(max(progress, 0), 1)
+        return p * p * (3 - 2 * p)
+    }
+
+    /// How much of the display the folded panel still covers.
+    static func visiblePanelFraction(settings: FrostSettings, progress: Double) -> Double {
+        let phi = min(max(progress, 0), 1) * Double.pi / 2
+        let D = max(settings.eyeDistance, 0.5)
+        let E = settings.eyeHeight
+        let sinPhi = sin(phi), cosPhi = cos(phi)
+        // The panel's far edge (panel distance 1) appears at this screen height.
+        func panelDistance(_ s: Double) -> Double {
+            D * s / max(D * cosPhi + (E - s) * sinPhi, 1e-5)
+        }
+        var low = 0.0, high = 1.0
+        for _ in 0..<24 {
+            let mid = (low + high) / 2
+            if panelDistance(mid) < 1 { low = mid } else { high = mid }
+        }
+        return min(max(low, 0), 1)
     }
 }
 
@@ -288,72 +383,98 @@ struct ReadoutRow: View {
     }
 }
 
-/// A live diagram of what the overlay is doing: the screen rectangle, the
-/// trapezoid the picture is folded into at the current angle, and how the frost
-/// ramps up from the hinge to the top.
+/// A live diagram of what the overlay is doing: the panel tipped away about the
+/// display's bottom edge, with the picture foreshortened onto it by the very same
+/// projection the shader runs, the blur ramp and the shadow ramp over that, and
+/// whatever is behind the lid above the panel's far edge.
 private struct FoldPreview: View {
     var controller: AppController
 
     var body: some View {
         let settings = controller.settings
-        let intensity = controller.intensity
-        let fold = settings.trapezoidAmount * intensity
+        let progress = min(max(controller.progress, 0), 1)
+        let motion = AnglePane.eased(progress)
+        let falloff = max(settings.rampFalloff, 0.05)
+        let shadow = min(1, motion * settings.farDarkening)
+        let panelFraction = AnglePane.visiblePanelFraction(settings: settings, progress: progress)
 
         return SectionCard("折叠预览") {
             HStack(alignment: .top, spacing: 14) {
                 Canvas { context, size in
-                    let fullWidth = size.width
-                    let inset = fold / (1 + fold) * fullWidth / 2
+                    let D = max(settings.eyeDistance, 0.5)
+                    let E = settings.eyeHeight
+                    let phi = progress * Double.pi / 2
+                    let sinPhi = sin(phi), cosPhi = cos(phi)
 
-                    // Outside the trapezoid is the surface behind the panel.
-                    context.fill(
-                        Path(CGRect(origin: .zero, size: size)),
-                        with: .color(.black.opacity(0.55))
+                    // The same mapping the shader uses, in canvas coordinates.
+                    func panelDistance(atScreenUp s: Double) -> Double {
+                        D * s / max(D * cosPhi + (E - s) * sinPhi, 1e-5)
+                    }
+                    func screenUp(forPanel h: Double) -> Double {
+                        var low = 0.0, high = 1.0
+                        for _ in 0..<24 {
+                            let mid = (low + high) / 2
+                            if panelDistance(atScreenUp: mid) < h { low = mid } else { high = mid }
+                        }
+                        return low
+                    }
+                    func y(forScreenUp s: Double) -> Double { size.height * (1 - s) }
+
+                    // Behind the lid.
+                    context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.black))
+
+                    // The picture, row by row, as it lands on the tipped panel.
+                    let rows = Int(size.height)
+                    for row in 0..<rows {
+                        let s = 1 - (Double(row) + 0.5) / Double(size.height)
+                        let h = panelDistance(atScreenUp: s)
+                        guard h <= 1 else { continue }
+                        let edge = min(max(h, 0), 1)
+                        let ramp = pow(edge, falloff)
+                        let dark = min(1, motion * settings.farDarkening
+                                       * pow(max((edge - settings.darkeningStart)
+                                                 / max(1 - settings.darkeningStart, 1e-4), 0), falloff))
+                        // Blur reads as a wash towards white on top of the picture.
+                        let veil = 0.75 * motion * ramp
+                        let base = 0.55 * (1 - dark) + 0.15
+                        let lifted = base * (1 - veil) + 0.95 * veil
+                        context.fill(
+                            Path(CGRect(x: 0, y: Double(row), width: size.width, height: 1)),
+                            with: .color(Color(white: lifted))
+                        )
+                    }
+
+                    // Grid lines at fixed picture heights: their bunching towards
+                    // the hinge is the foreshortening, drawn to scale.
+                    for step in 1..<10 {
+                        let h = Double(step) / 10
+                        let y = y(forScreenUp: screenUp(forPanel: h))
+                        let line = Path(CGRect(x: 0, y: y - 0.5, width: size.width, height: 1))
+                        context.fill(line, with: .color(.accentColor.opacity(0.55)))
+                    }
+
+                    // The panel's far edge.
+                    let edgeY = y(forScreenUp: panelFraction)
+                    context.stroke(
+                        Path { path in
+                            path.move(to: CGPoint(x: 0, y: edgeY))
+                            path.addLine(to: CGPoint(x: size.width, y: edgeY))
+                        },
+                        with: .color(.accentColor),
+                        lineWidth: 1.2
                     )
-
-                    var clip = Path()
-                    clip.move(to: CGPoint(x: inset, y: 0))
-                    clip.addLine(to: CGPoint(x: fullWidth - inset, y: 0))
-                    clip.addLine(to: CGPoint(x: fullWidth, y: size.height))
-                    clip.addLine(to: CGPoint(x: 0, y: size.height))
-                    clip.closeSubpath()
-
-                    var content = context
-                    content.clip(to: clip)
-                    let stripes = 14
-                    for index in 0..<stripes {
-                        let x = fullWidth * Double(index) / Double(stripes)
-                        content.fill(
-                            Path(CGRect(x: x, y: 0, width: fullWidth / Double(stripes) / 2, height: size.height)),
-                            with: .color(.accentColor.opacity(0.28))
-                        )
-                    }
-                    if intensity > 0.001 {
-                        content.fill(
-                            Path(CGRect(origin: .zero, size: size)),
-                            with: .linearGradient(
-                                Gradient(stops: [
-                                    .init(color: .white.opacity(0), location: 0),
-                                    .init(color: .white.opacity(0.9 * intensity), location: 1),
-                                ]),
-                                startPoint: CGPoint(x: 0, y: size.height),
-                                endPoint: CGPoint(x: 0, y: 0)
-                            )
-                        )
-                    }
-
-                    context.stroke(clip, with: .color(.accentColor), lineWidth: 1.2)
                 }
                 .frame(width: 200, height: 126)
-                .background(Color(nsColor: .textBackgroundColor))
+                .background(Color.black)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 6) {
-                    ReadoutRow(label: "强度", value: String(format: "%.2f", intensity))
-                    ReadoutRow(label: "顶端宽度", value: String(format: "%.0f%%", 100 / (1 + fold)))
-                    ReadoutRow(label: "上/下模糊", value: String(format: "%.0f / %.0f pt",
-                                                                settings.maxBlurPoints, settings.minBlurPoints))
-                    Text("示意图：面板沿底边向下折，画面本身不缩放，梯形之外是背景。")
+                    ReadoutRow(label: "折叠进度", value: String(format: "%.2f", progress))
+                    ReadoutRow(label: "远端模糊", value: String(format: "%.0f pt",
+                                                               settings.blurRadiusPoints * motion))
+                    ReadoutRow(label: "远端压暗", value: String(format: "%.0f%%", shadow * 100))
+                    ReadoutRow(label: "面板可见高度", value: String(format: "%.0f%%", panelFraction * 100))
+                    Text("示意图：面板沿屏幕底边向下折，画面按同一套正视投影前缩到面板上；面板之外是盖子背后的暗处。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

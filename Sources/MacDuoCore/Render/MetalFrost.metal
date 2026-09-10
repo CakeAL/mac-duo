@@ -2,17 +2,40 @@
 //  MetalFrost.metal
 //  MacDuo
 //
-//  The picture stays where it would be at 90°: a flat panel hinged along the
-//  bottom edge of the display, tipped away from the viewer. Seen head-on it is a
-//  trapezoid — full width at the hinge, narrower at the top, sides slanting
-//  straight in, rows drawn together as they recede.
+//  A port of the screen shader in https://github.com/chuspeeism/iphone-duo
+//  (main.js, `screenShader`) to a laptop lid, geometry included.
 //
-//  The fold is geometry: the quad is drawn as the trapezoid and the picture
-//  coordinates are squeezed to match, so the picture itself is *clipped*, never
-//  rescaled. Everything the panel no longer covers shows the surface behind it.
+//  His construction, in his order, with his constants:
 //
-//  On top of that geometry the frost is deepest where the panel is furthest
-//  away, so it is heaviest along the top edge and thinnest down at the hinge.
+//    progress        fold amount, 0 = flat, 1 = shut       -> the lid angle
+//    foldAngle       progress * pi/2
+//    screenColor()   fixed front-view projection: the ray from the eye through
+//                    the fragment meets the *unfolded* screen plane, and the
+//                    picture is read there — so content on a folded panel is
+//                    foreshortened the way a real panel is.
+//    edge            0 at the hinge, 1 at the far edge, measured on the panel
+//    motion          smoothstep(0, 1, progress)
+//    blurGradient    clamp(edge, 0, 1)
+//    darkenGradient  clamp((edge - 0.2) / 0.8, 0, 1)
+//    radius          72 * motion * pow(blurGradient, 1.35)          [source px]
+//    effect          motion * pow(darkenGradient, 1.35)
+//    color          *= 1 - min(1, effect * 2)
+//    blur            5x5 taps, weights 1:4:6:4:1 (normalised by 256), spacing =
+//                    radius, each tap read from mip level max(baseLod, log2(radius))
+//                    and pre-multiplied by how much of the panel it is on, so
+//                    colour dissolves into the margin past the panel's edge.
+//
+//  Three things differ, because this is a laptop whose screen *is* the display
+//  rather than a 3D model of a folding phone:
+//
+//    1. his fold axis is the phone's vertical book hinge and he has two screens
+//       (inner and outer); a MacBook hinges along the bottom edge and has one
+//       screen, so the panel tips away about the display's bottom edge and
+//       `edge` runs bottom (hinge) -> top (far edge);
+//    2. `progress` comes from the lid-angle sensor instead of a slider;
+//    3. his margin is a black border inside his image; here the picture fills
+//       the display, so only the panel's far edge dissolves into black — the
+//       display's own left, right and bottom edges clamp instead.
 //
 
 #include <metal_stdlib>
@@ -20,205 +43,179 @@ using namespace metal;
 
 struct FrostVertexOut {
     float4 position [[position]];
-    float2 uv;              // picture coordinates (may fall outside 0...1)
-    float  ramped;          // 0 at the hinge, 1 at the top: frost strength ramp
+    float2 uv;              // picture coordinates: (0,0) is the picture's top-left
 };
 
-// Layout is 16-byte clean in both languages. Keep the Swift twin in
+// Layout is three 16-byte rows in both languages. Keep the Swift twin in
 // MetalFrostRenderer.swift in sync — a mismatch here shifts every uniform.
 struct FrostUniforms {
-    // Target geometry
-    float4 targetSize;      // xy = render target size in pixels, zw = reciprocals
+    // Picture geometry
+    float2 pictureSize;     // captured picture size in pixels
+    float  progress;        // 0 = standing at 90°, 1 = fully folded
+    float  blurRadiusPx;    // strongest blur radius, in picture pixels
 
-    // Fold geometry
-    //   v     = 0 at the hinge row (bottom), 1 at the top
-    //   scale = 1 + v * fold      width of the panel at that row
-    float  fold;
-    float  fold2;           // fold * fold (reserved)
-    float2 displaySize;     // display size in pixels
+    // Ramp
+    float  falloff;         // exponent of the ramp; 1.35 in the reference
+    float  hingeClear;      // fraction of the panel at the hinge kept clear
+    float  darkenStart;     // where the shadow begins along the ramp; 0.2 there
+    float  darkenGain;      // shadow strength; 2.0 there
 
-    // Frost ramp: ramp = smoothstep(nearClear, 1, v), then
-    //   ramp_curved = 1 - (1 - ramp)^(1 + blurSoftness * 2)
-    float  nearClear;       // fraction of the panel kept clear at the hinge
-    float  blurSoftness;    // 0 = crisp stacked levels, 1 = one smooth ramp
-    float  frostOpacity;    // milky wash strength
-    float  saturation;      // colour kept in the frosted area
+    // Glass
+    float  frostOpacity;    // milky wash, 0...1 (0 = the reference's look)
+    float  frostSaturation; // colour kept, 0...1 (1 = the reference's look)
 
-    // More look
-    float  dim;             // luminance pull-down in the frosted area
-    float  globalMix;       // overall strength
-    float  backgroundDim;   // how dark the surface behind the panel is
-    float  pad0;
-
-    // Blur radii of the three stacked levels, in pixels
-    float  radius0;
-    float  radius1;
-    float  radius2;
-    float  geometryDebug;   // 1 = output the panel coverage mask, not colour
+    // The viewer, in units of screen heights — his `uiReferenceEye` sits 40 units
+    // away from a screen about 11 units tall, so D is about 3.6.
+    float  eyeDistance;     // viewing distance
+    float  eyeHeight;       // height of the eye above the hinge
 };
-
-// MARK: - Helpers
-
-static inline float luminance(float3 c) {
-    return dot(c, float3(0.2126, 0.7152, 0.0722));
-}
 
 // MARK: - Vertex
 
-/// Folds the screen rectangle into the panel trapezoid and hands the fragment
-/// stage the matching picture coordinates.
-///
-/// Corner 0 is the top-left, then top-right, bottom-left, bottom-right, matching
-/// a triangle strip. Metal's texture space has (0,0) at the top-left with y
-/// growing downwards; `t` below is 0 at the bottom edge and 1 at the top so the
-/// fold reads the same way it does in the world.
-vertex FrostVertexOut frost_vertex(uint vertexID [[vertex_id]],
-                                   constant FrostUniforms &u [[buffer(0)]]) {
+/// A plain full-screen quad. Metal's NDC has y = +1 at the top of the target,
+/// and the picture's own first row is its top, so `uv.y` is flipped here and
+/// nowhere else: uv = (0,0) is the picture's top-left no matter what.
+vertex FrostVertexOut frost_vertex(uint vertexID [[vertex_id]]) {
     const float2 corners[4] = {
-        float2(-1.0, -1.0),   // 0 top-left
-        float2( 1.0, -1.0),   // 1 top-right
-        float2(-1.0,  1.0),   // 2 bottom-left
-        float2( 1.0,  1.0),   // 3 bottom-right
-    };
-    float2 corner = corners[vertexID];
-
-    // Height on the screen: 0 at the hinge (bottom edge), 1 at the top.
-    float t = (corner.y + 1.0) * 0.5;
-
-    // How wide the panel is at this height, as a fraction of the screen.
-    //
-    // The panel keeps its full width at the hinge and loses `fold` of it at the
-    // top, so the flat picture has to be drawn wider than the screen up at the
-    // hinge and narrower than it at the top. Drawing it that way and mapping the
-    // picture 0...1 across the quad is what makes the sides read as *clipped*
-    // rather than squashed.
-    float scale = (1.0 + u.fold * (1.0 - t)) / (1.0 + u.fold);
-
-    FrostVertexOut out;
-    out.position = float4(corner.x * scale, corner.y, 0.0, 1.0);
-
-    // Picture coordinates: the whole picture across the quad, laid down so the
-    // top-left corner of the quad is the top-left of the picture.
-    out.uv = float2((corner.x + 1.0) * 0.5 * scale, (corner.y + 1.0) * 0.5);
-
-    // Frost ramp: 0 at the hinge, 1 at the top, softened towards the hinge.
-    float width = max(1.0 - u.nearClear, 0.05);
-    float ramp = clamp((t - u.nearClear) / width, 0.0, 1.0);
-    ramp = ramp * ramp * (3.0 - 2.0 * ramp);
-    out.ramped = ramp;
-
-    return out;
-}
-
-/// Plain full-screen quad, used by the blur passes: they work on the screen's
-/// own pixel grid and must not see the fold at all.
-vertex FrostVertexOut frost_vertex_flat(uint vertexID [[vertex_id]]) {
-    const float2 corners[4] = {
-        float2(-1.0, -1.0),
-        float2( 1.0, -1.0),
-        float2(-1.0,  1.0),
-        float2( 1.0,  1.0),
+        float2(-1.0, -1.0),   // bottom-left
+        float2( 1.0, -1.0),   // bottom-right
+        float2(-1.0,  1.0),   // top-left
+        float2( 1.0,  1.0),   // top-right
     };
     float2 corner = corners[vertexID];
 
     FrostVertexOut out;
     out.position = float4(corner, 0.0, 1.0);
-    out.uv = float2((corner.x + 1.0) * 0.5, (corner.y + 1.0) * 0.5);
-    out.ramped = 0.0;
+    out.uv = float2((corner.x + 1.0) * 0.5, (1.0 - corner.y) * 0.5);
     return out;
 }
 
-// MARK: - Downscale
+// MARK: - Picture copy
 
-// Downscaling through a quad (instead of a blit) lets the rasteriser do the
-// averaging, which removes high-frequency detail before the big Gaussian passes
-// and keeps the wide blur cheap.
-fragment float4 frost_downscale(FrostVertexOut in [[stage_in]],
-                                texture2d<float> source [[texture(0)]]) {
-    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-    return float4(source.sample(linearSampler, in.uv).rgb, 1.0);
+/// Fills mip level 0 of the working picture from the captured frame.
+///
+/// The coordinate comes from `[[position]]` rather than the interpolated uv, so
+/// this pass cannot flip or shift the picture even if the vertex mapping above
+/// were wrong: fragment (x, y) reads texel (x, y).
+fragment float4 frost_copy(FrostVertexOut in [[stage_in]],
+                           constant FrostUniforms &u [[buffer(0)]],
+                           texture2d<float> source [[texture(0)]]) {
+    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+    float2 uv = in.position.xy / max(u.pictureSize, float2(1.0));
+    return float4(source.sample(linearSampler, uv).rgb, 1.0);
 }
 
 // MARK: - Composite
 
 fragment float4 frost_fragment(FrostVertexOut in [[stage_in]],
                                constant FrostUniforms &u [[buffer(0)]],
-                               texture2d<float> sharp [[texture(0)]],
-                               texture2d<float> blur1 [[texture(1)]],
-                               texture2d<float> blur2 [[texture(2)]],
-                               texture2d<float> blur3 [[texture(3)]]) {
-    // Clamped taps outside the picture give the screen's own edge colours, which
-    // is the nearest thing to the surface behind the panel we can know about.
-    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+                               texture2d<float> picture [[texture(0)]]) {
+    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear,
+                                    mip_filter::linear, address::clamp_to_edge);
 
     float2 uv = in.uv;
 
-    // Does the panel still cover this pixel? The fold leaves the upper corners
-    // and the area above the panel empty.
-    bool outside = uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0;
+    float progress = clamp(u.progress, 0.0, 1.0);
+    float motion = smoothstep(0.0, 1.0, progress);
+    float exponent = max(u.falloff, 0.05);
 
-    float2 sampleUV = clamp(uv, float2(0.0), float2(1.0));
-    float3 dim = float3(u.backgroundDim);
+    float phi = progress * 1.5707963268;          // 0 = at 90°, pi/2 = shut
+    float sinPhi = sin(phi);
+    float cosPhi = cos(phi);
 
-    // Verification hooks. Both bypass the frost so the fold and the blur can be
-    // measured independently of each other.
-    if (u.geometryDebug > 2.5) {
-        // Coverage mask: the panel's footprint, nothing else.
-        return float4(outside ? float3(0.0) : float3(1.0), 1.0);
-    }
-    if (u.geometryDebug > 1.5) {
-        // Fold applied, sharp picture only — no blur anywhere. Comparing this
-        // with the frosted render isolates what the frost removed.
-        float3 sample = sharp.sample(linearSampler, sampleUV).rgb;
-        return float4(outside ? sample * dim : sample, 1.0);
-    }
-    if (u.geometryDebug > 0.5) {
-        // Fold applied, but the sharp picture only — no blur at all.
-        return float4(sharp.sample(linearSampler, sampleUV).rgb * (outside ? dim : float3(1.0)), 1.0);
-    }
+    // Height on the *display* above the hinge: 0 at the bottom edge, 1 at the
+    // top. Everything below is in these units, so `panelDistance` is directly
+    // the panel coordinate the reference calls `edge`.
+    float screenUp = 1.0 - uv.y;
 
-    // Blur ramp: heaviest at the top, thinning out towards the hinge.
-    float ramp = in.ramped;
+    // His fixed front-view projection, inverted: the ray from the eye through
+    // this pixel meets the tipped panel at
+    //
+    //     h = D * s / (D * cos(phi) + (E - s) * sin(phi))
+    //
+    // which is exactly `s` while the lid stands at 90° — the picture then passes
+    // through pixel for pixel — and grows past 1 as the lid folds, so the picture
+    // is foreshortened towards the hinge and what lies past the panel's far edge
+    // is whatever is behind the lid.
+    float denominator = max(u.eyeDistance * cosPhi + (u.eyeHeight - screenUp) * sinPhi, 1e-5);
+    float panelDistance = u.eyeDistance * screenUp / denominator;
 
-    float3 color = sharp.sample(linearSampler, sampleUV).rgb;
-    if (outside) { color *= dim; }
-
-    // Stacked levels, each taking over further up the ramp. Low blurSoftness
-    // keeps the steps crisp (layered glass); high melts them into one ramp.
-    float curve = 1.0 + u.blurSoftness * 2.0;
-    float curved = 1.0 - pow(max(1.0 - ramp, 0.0), curve);
-
-    float w1 = smoothstep(0.18, 0.18 + u.blurSoftness * 0.45 + 0.03, curved);
-    float w2 = smoothstep(0.50, 0.50 + u.blurSoftness * 0.45 + 0.03, curved);
-    float w3 = smoothstep(0.82, 0.82 + u.blurSoftness * 0.16 + 0.02, curved);
-
-    float3 level;
-    if (w1 > 0.0) {
-        level = blur1.sample(linearSampler, sampleUV).rgb;
-        color = mix(color, outside ? level * dim : level, w1);
-    }
-    if (w2 > 0.0) {
-        level = blur2.sample(linearSampler, sampleUV).rgb;
-        color = mix(color, outside ? level * dim : level, w2);
-    }
-    if (w3 > 0.0) {
-        level = blur3.sample(linearSampler, sampleUV).rgb;
-        color = mix(color, outside ? level * dim : level, w3);
+    // The panel's far edge, feathered by half a screen pixel's worth of panel and
+    // scaled by the fold, so a lid standing at 90° has no edge to antialias and
+    // stays exact to the last pixel.
+    float panelAA = 0.5 * max(fwidth(panelDistance), 1e-6) * smoothstep(0.0, 0.05, progress);
+    float onPanel = 1.0 - smoothstep(1.0 - panelAA, 1.0 + panelAA, panelDistance);
+    if (onPanel <= 0.0) {
+        // Behind the lid.
+        return float4(0.0, 0.0, 0.0, 1.0);
     }
 
-    // Frosted-glass wash: desaturate, lift towards white, pull luminance down,
-    // all masked by the same ramp.
-    float luma = luminance(color);
-    float3 desaturated = mix(float3(luma), color, clamp(u.saturation, 0.0, 1.0));
-    float3 frosted = mix(desaturated, float3(1.0), clamp(u.frostOpacity, 0.0, 1.0));
-    frosted *= (1.0 - clamp(u.dim, 0.0, 1.0));
+    // The picture lives on the panel, so its coordinates follow the panel: the
+    // hinge keeps the picture's own bottom edge.
+    float2 pictureUV = float2(uv.x, 1.0 - panelDistance);
 
-    float frostMask = smoothstep(0.0, 0.85, ramp);
-    float3 result = mix(color, frosted, frostMask * u.globalMix);
+    float edge = clamp((panelDistance - u.hingeClear) / max(1.0 - u.hingeClear, 1e-4), 0.0, 1.0);
+    float blurGradient = clamp(edge, 0.0, 1.0);
+    float darkenGradient = clamp((edge - u.darkenStart) / max(1.0 - u.darkenStart, 1e-4), 0.0, 1.0);
 
-    // Keep the reserved slots live so the packed layout stays honest.
-    result *= 1.0 + 0.0 * (u.fold2 + u.pad0 + u.radius0 + u.radius1 + u.radius2
-                           + u.displaySize.x + u.targetSize.x);
+    float effect = motion * pow(darkenGradient, exponent);
+    float radius = max(u.blurRadiusPx, 0.0) * motion * pow(blurGradient, exponent);
 
-    return float4(result, 1.0);
+    // His `baseLod`: how many picture texels one screen pixel covers. A tap must
+    // never be finer than the input can resolve — and the fold minifies the
+    // picture towards the hinge, which this picks up for free.
+    float2 texel = 1.0 / max(u.pictureSize, float2(1.0));
+    float2 duvdx = dfdx(pictureUV);
+    float2 duvdy = dfdy(pictureUV);
+    float baseLod = log2(max(1.0, max(length(duvdx * u.pictureSize),
+                                      length(duvdy * u.pictureSize))));
+
+    float3 color;
+    if (radius < 0.35) {
+        // Hinge side, and the whole screen while the lid stands at 90°: mip level
+        // 0, explicitly — an implicit level would blend in the prefiltered chain
+        // and soften the one part of the picture that has to stay exact.
+        color = picture.sample(linearSampler, pictureUV, level(0.0)).rgb;
+    } else {
+        float maxLod = floor(log2(max(max(u.pictureSize.x, u.pictureSize.y), 2.0)));
+        float lod = clamp(max(baseLod, log2(max(radius, 1.0))), 0.0, maxLod);
+        float2 spacing = radius * texel;
+        // How far a tap spreads, in picture coordinates: the screen pixel's own
+        // footprint, or the tap's radius, whichever is larger. Both have to be
+        // in uv units — the coverage below is compared against a uv value.
+        float footprint = max(0.5 * abs(duvdy.y), radius * 0.75 * texel.y);
+
+        float3 sum = float3(0.0);
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                float wx = (x == 0) ? 6.0 : (abs(x) == 1 ? 4.0 : 1.0);
+                float wy = (y == 0) ? 6.0 : (abs(y) == 1 ? 4.0 : 1.0);
+                float2 tapUV = pictureUV + float2(float(x), float(y)) * spacing;
+                // How much of the panel this tap is on: past the far edge the
+                // picture gives way to the dark behind it, exactly as his taps
+                // fade into his margin.
+                float tapCoverage = 1.0 - smoothstep(1.0 - footprint, 1.0 + footprint,
+                                                     1.0 - tapUV.y);
+                sum += picture.sample(linearSampler, clamp(tapUV, float2(0.0), float2(1.0)),
+                                      level(lod)).rgb * tapCoverage * (wx * wy);
+            }
+        }
+        color = sum * (1.0 / 256.0);
+    }
+
+    // Darkening: his `color *= 1 - min(1, effect * 2)`, with the doubling folded
+    // into `darkenGain` (2.0 is his value).
+    color *= 1.0 - min(1.0, effect * u.darkenGain);
+
+    // Optional frosting on top (both default to the reference's look: none).
+    // Like everything else here it is masked by the fold, so the hinge — and the
+    // whole picture while the lid stands at 90° — passes through untouched.
+    float glass = motion * blurGradient;
+    float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+    float saturation = mix(1.0, clamp(u.frostSaturation, 0.0, 1.0), clamp(glass, 0.0, 1.0));
+    color = mix(float3(luma), color, saturation);
+    color = mix(color, float3(1.0), clamp(u.frostOpacity * glass, 0.0, 1.0));
+
+    return float4(color * onPanel, 1.0);
 }
