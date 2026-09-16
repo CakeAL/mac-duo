@@ -5,10 +5,10 @@
 //  Per frame:
 //    1. the captured screen is copied 1:1 into a mipmapped working picture;
 //    2. the mip chain is generated for it;
-//    3. the composite draws that picture as a trapezoid — bottom edge pinned to
-//       the bottom of the display, top edge narrowed by the fold — over a black
-//       target, and blurs it with a radius that is the full amount at the top of
-//       the picture and zero at the hinge.
+//    3. the composite projects that picture through one homography into a
+//       trapezoid — bottom edge pinned to the bottom of the display, top edge
+//       narrowed by the fold — over a black target, and blurs it with a radius
+//       that is the full amount at the top of the picture and zero at the hinge.
 //
 //  Sampling a prefiltered mip level per tap (level = log2(radius)) is what lets
 //  the radius vary continuously from row to row instead of stepping between a
@@ -242,8 +242,8 @@ public final class MetalFrostRenderer {
             blit.endEncoding()
         }
 
-        // Pass 3: the trapezoid, the blur ramp and — everywhere the trapezoid is
-        // not — black, which is what the clear leaves behind.
+        // Pass 3: the projective trapezoid, the blur ramp and — everywhere the
+        // trapezoid is not — black, which is what the clear leaves behind.
         let descriptor = MTLRenderPassDescriptor()
         descriptor.colorAttachments[0].texture = target
         descriptor.colorAttachments[0].loadAction = .clear

@@ -14,13 +14,13 @@ enum EmbeddedShader {
 //  One screenshot, stretched into a trapezoid, with a blur that is heaviest at
 //  the far edge and gone at the hinge. Nothing else.
 //
-//  Geometry (vertex stage): the picture is drawn as a trapezoid whose *bottom*
-//  edge is the bottom edge of the display and does not move. Only the top two
-//  corners come in as the lid folds, so the picture narrows towards the far end
-//  exactly like the inner screen of the folding reference; the picture is
-//  stretched to fill that trapezoid rather than cropped. Whatever the trapezoid
-//  does not cover is the space behind the lid, and the target is cleared to
-//  black, so that is what shows there.
+//  Geometry (vertex stage): the picture is projected into a trapezoid whose
+//  *bottom* edge is the bottom edge of the display and does not move. Only the
+//  top two corners come in as the lid folds. The clip-space w values describe
+//  one homography for the whole quad, like projecting a planar screen from a
+//  fixed eye; this is deliberately not two affine triangle warps. Whatever the
+//  trapezoid does not cover is the space behind the lid, and the target is
+//  cleared to black, so that is what shows there.
 //
 //  Blur (fragment stage): a radius that is the full amount at the top of the
 //  picture, zero at the bottom (the hinge), shaped by an exponent, and scaled by
@@ -58,9 +58,23 @@ struct FrostUniforms {
 
 // MARK: - Vertex
 
-/// The trapezoid. Metal's NDC has y = +1 at the top of the target and the
-/// picture's own first row is its top, so `uv.y` is flipped here and nowhere
-/// else: uv = (0,0) is the picture's top-left no matter what.
+/// The projective trapezoid. Metal's NDC has y = +1 at the top of the target
+/// and the picture's own first row is its top, so `uv.y` is flipped here and
+/// nowhere else: uv = (0,0) is the picture's top-left no matter what.
+///
+/// A tempting implementation is `position = float4(x * edgeScale, y, 0, 1)`.
+/// That gets the outline right but makes the rasterizer interpolate the picture
+/// independently and affinely in the quad's two triangles. It is not a planar
+/// projection and leaves a derivative seam along their diagonal.
+///
+/// For a top width `s`, the homography from source NDC (x,y) to the trapezoid is
+///
+///     X = (1-|c|) x / (1+c y), Y = (y+c) / (1+c y)
+///     c = (1-s) / (1+s)
+///
+/// Emitting its homogeneous numerator and denominator as clip position makes
+/// Metal's perspective-correct varying interpolation recover the same mapping
+/// for `uv`. Negating c mirrors it: top pinned, bottom narrow.
 vertex FrostVertexOut frost_vertex(uint vertexID [[vertex_id]],
                                    constant FrostUniforms &u [[buffer(0)]]) {
     const float2 corners[4] = {
@@ -71,14 +85,15 @@ vertex FrostVertexOut frost_vertex(uint vertexID [[vertex_id]],
     };
     float2 corner = corners[vertexID];
 
-    // 只有"远端"那一对顶点会动，另一条边钉死在屏幕边缘上。
-    // anchor = 0：远端是顶端（盖子往下合，底边不动，这是需求里的那一种）。
-    // anchor = 1：远端是底端（往后展开时镜像过来的那一种）。
-    float towardFarEdge = u.anchor < 0.5 ? 1.0 : -1.0;
-    float scale = (corner.y * towardFarEdge > 0.0) ? clamp(u.topScale, 0.02, 1.0) : 1.0;
+    float edgeScale = clamp(u.topScale, 0.02, 1.0);
+    float c = (1.0 - edgeScale) / (1.0 + edgeScale);
+    if (u.anchor >= 0.5) c = -c;
 
     FrostVertexOut out;
-    out.position = float4(corner.x * scale, corner.y, 0.0, 1.0);
+    out.position = float4(corner.x * (1.0 - abs(c)),
+                          corner.y + c,
+                          0.0,
+                          1.0 + c * corner.y);
     out.uv = float2((corner.x + 1.0) * 0.5, (1.0 - corner.y) * 0.5);
     return out;
 }

@@ -3,15 +3,16 @@
 //  MacDuo (verification harness)
 //
 //  Exercises everything the overlay needs at runtime, without opening a window:
-//  the shader library, the pipelines, the trapezoid and the blur ramp. Run it
-//  with ./verify.sh — a broken shader or a Metal regression then fails before the
-//  app is ever launched.
+//  the shader library, the pipelines, the projective trapezoid and the blur ramp.
+//  Run it with ./verify.sh — a broken shader or a Metal regression then fails
+//  before the app is ever launched.
 //
-//  The four frames each isolate one claim:
+//  The five frames each isolate one claim:
 //
 //    measure  red ramp + checker + a white top band and a black bottom band
 //    white    flat white            -> the trapezoid's outline and the black around it
 //    edge     left black, right white -> the blur radius per row, as a transition width
+//    project  vertical grey ramp      -> the quad is one homography, not two affine triangles
 //    preview  a stand-in desktop    -> the PNGs, for eyeballing
 //
 //  Every pixel access goes through the channel helpers below. The capture format
@@ -95,6 +96,15 @@ enum RuntimeProbe {
     /// the black-to-white transition.
     static func makeEdgeFrame() -> CVPixelBuffer? {
         makeBuffer { x, _ in x < width / 2 ? (0, 0, 0) : (255, 255, 255) }
+    }
+
+    /// A vertical linear ramp. Under a homography every pixel on one output row
+    /// must resolve to the same source row, and that row has a closed-form value.
+    static func makeProjectionFrame() -> CVPixelBuffer? {
+        makeBuffer { _, y in
+            let value = UInt8((y * 255) / (height - 1))
+            return (value, value, value)
+        }
     }
 
     /// A stand-in desktop for the preview PNGs: wallpaper, a menu bar, a window
@@ -290,6 +300,7 @@ enum RuntimeProbe {
         guard let measure = makeMeasureFrame(),
               let white = makeWhiteFrame(),
               let edge = makeEdgeFrame(),
+              let project = makeProjectionFrame(),
               let preview = makePreviewFrame() else {
             fail("could not create the test frames")
         }
@@ -428,6 +439,37 @@ enum RuntimeProbe {
             }
             settings.mirror = false
 
+            // The outline alone cannot distinguish a homography from two affine
+            // triangle warps. Check the source row implied by the closed-form
+            // inverse projection, at several x positions on each output row.
+            let edgeScale = settings.topWidthRatio(at: 1)
+            print("homography: source rows follow one perspective projection")
+            for isMirrored in [false, true] {
+                let projected = render(project, progress: 1.0, mirror: isMirrored)
+                let outline = render(white, progress: 1.0, mirror: isMirrored)
+                let magnitude = (1 - edgeScale) / (1 + edgeScale)
+                let c = isMirrored ? -magnitude : magnitude
+                for fraction in [0.10, 0.30, 0.50, 0.70, 0.90] {
+                    let row = min(max(Int(Double(height) * fraction), 2), height - 3)
+                    let screenDown = (Double(row) + 0.5) / Double(height)
+                    let sourceDown = (1 + c) * screenDown
+                        / (1 - c + 2 * c * screenDown)
+                    let expected = Int((sourceDown * 255).rounded())
+                    let run = litRun(outline, row: row)
+                    let inset = max(8, run.count / 5)
+                    let samples = [run.first + inset, width / 2, run.last - inset]
+                    for x in samples {
+                        let actual = red(projected, row, x)
+                        guard abs(actual - expected) <= 2 else {
+                            let mode = isMirrored ? "mirrored" : "normal"
+                            fail("\(mode) projective mapping is wrong at (\(x), \(row)): got \(actual), expected \(expected)")
+                        }
+                    }
+                }
+            }
+            print("homography: OK in both directions (no affine-triangle diagonal seam)")
+            print("")
+
             settings.maxBlurRadius = 72
 
             // MARK: 3. The blur ramp: heaviest at the top, nothing at the hinge
@@ -442,13 +484,19 @@ enum RuntimeProbe {
             var wanted: [Double] = []
             for fraction in [0.02, 0.25, 0.5, 0.75, 0.98] {
                 let row = min(max(Int(Double(height) * fraction), 4), height - 5)
-                let screenUp = 1 - (Double(row) + 0.5) / Double(height)
+                let screenDown = (Double(row) + 0.5) / Double(height)
+                let screenUp = 1 - screenDown
+                let edgeScale = settings.topWidthRatio(at: progress)
+                let c = (1 - edgeScale) / (1 + edgeScale)
+                let sourceDown = (1 + c) * screenDown
+                    / (1 - c + 2 * c * screenDown)
+                let sourceUp = 1 - sourceDown
                 // The blur is done in picture space, and the trapezoid squeezes
                 // the picture horizontally, so the width seen on screen is the
                 // radius times the local horizontal scale.
-                let scale = 1 + (settings.topWidthRatio(at: progress) - 1) * screenUp
+                let scale = 1 + (edgeScale - 1) * screenUp
                 let expected = settings.maxBlurRadius * progress
-                    * pow(screenUp, settings.blurFalloff) * scale
+                    * pow(sourceUp, settings.blurFalloff) * scale
                 let measured = transitionWidth(edgeBlurred, row: row) / 2.563
                 let reference = detail(pristine, row: row)
                 let ratio = reference > 0.0001 ? detail(blurred, row: row) / reference : 1
