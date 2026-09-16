@@ -54,10 +54,10 @@ public final class FrostSettings {
     /// near half sharp and bunch the blur up at the far edge.
     public var blurFalloff: Double { didSet { persist(\.blurFalloff, key: "blurFalloff") } }
 
-    // MARK: - Extras (both off by default)
+    // MARK: - Finishing
 
-    /// Extra darkening at the far edge, 0 = none. The fold is carried by the
-    /// trapezoid and the blur; this is only here to taste.
+    /// Extra darkening at the far edge, 0 = none. The reference uses 2: the
+    /// first fifth stays bright, then the far end reaches black as it folds.
     public var farDarkening: Double { didSet { persist(\.farDarkening, key: "farDarkening") } }
     /// Milky wash over the blurred part, 0 = none.
     public var frostOpacity: Double { didSet { persist(\.frostOpacity, key: "frostOpacity") } }
@@ -100,7 +100,7 @@ public final class FrostSettings {
     /// Bumped whenever the effect changes shape: a stored value from an older
     /// version describes knobs that no longer mean the same thing, so it is
     /// dropped rather than used to judge a different effect.
-    public static let settingsVersion = 7
+    public static let settingsVersion = 8
 
     public init(defaults store: UserDefaults = .standard) {
         self.store = store
@@ -118,8 +118,8 @@ public final class FrostSettings {
             "responseSmoothing": 0.06,
             "topNarrowing": 0.35,
             "maxBlurRadius": 72.0,
-            "blurFalloff": 1.2,
-            "farDarkening": 0.0,
+            "blurFalloff": 1.35,
+            "farDarkening": 2.0,
             "frostOpacity": 0.0,
             "frostSaturation": 1.0,
             "angleOffset": 0.0,
@@ -155,7 +155,9 @@ public final class FrostSettings {
 
     /// Blur radius at the far edge, in points, at this fold.
     public func blurRadius(at progress: Double) -> Double {
-        maxBlurRadius * min(max(progress, 0), 1)
+        let p = min(max(progress, 0), 1)
+        let motion = p * p * (3 - 2 * p)
+        return maxBlurRadius * motion
     }
 
     /// 效果强度，0…1 —— 与参考实现同一个式子。

@@ -32,7 +32,7 @@ public struct FrostUniforms {
     var blurRadiusPx: Float = 0
 
     // Row 2: the ramp and the trapezoid
-    var falloff: Float = 1.2
+    var falloff: Float = 1.35
     var darkenGain: Float = 0
     var topScale: Float = 1
     var frostOpacity: Float = 0

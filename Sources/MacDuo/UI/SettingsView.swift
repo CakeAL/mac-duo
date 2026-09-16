@@ -82,7 +82,7 @@ private struct FoldPane: View {
 
             SectionCard("高斯模糊（顶端最强，往下递减）") {
                 LabeledSlider(title: "顶端模糊半径", value: $settings.maxBlurRadius, range: 0...200, format: "%.0f pt")
-                Text("半径沿画面从上往下递减到 0：顶端最糊，铰链端逐像素清晰。")
+                Text("半径沿画面从上往下递减到 0，每一行横跨整屏生效；画面边缘也会向外散射。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -92,8 +92,11 @@ private struct FoldPane: View {
                     .foregroundStyle(.secondary)
             }
 
-            SectionCard("附加（默认关闭）") {
+            SectionCard("光学收尾") {
                 LabeledSlider(title: "远端额外压暗", value: $settings.farDarkening, range: 0...2, format: "%.2f")
+                Text("默认按 iPhone Duo 参考效果在远端压暗；设为 0 可关闭。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 LabeledSlider(title: "白雾浓度", value: $settings.frostOpacity, range: 0...0.4, format: "%.2f")
                 LabeledSlider(title: "保留色彩", value: $settings.frostSaturation, range: 0...1, format: "%.2f")
             }
@@ -284,7 +287,7 @@ private struct FoldPreview: View {
         // 展开侧镜像时，能动的是底边。
         let mirror = settings.mirror
         let falloff = max(settings.blurFalloff, 0.05)
-        let blur = settings.maxBlurRadius * progress
+        let blur = settings.blurRadius(at: progress)
 
         return SectionCard("效果预览") {
             HStack(alignment: .top, spacing: 14) {
@@ -327,7 +330,7 @@ private struct FoldPreview: View {
                     if progress > 0.001 {
                         let stops = (0...5).map { step -> Gradient.Stop in
                             let t = Double(step) / 5
-                            return .init(color: .white.opacity(0.75 * progress * pow(t, falloff)),
+                            return .init(color: .white.opacity(0.75 * progress * pow(1 - t, falloff)),
                                          location: t)
                         }
                         content.fill(
@@ -346,7 +349,7 @@ private struct FoldPreview: View {
                     ReadoutRow(label: "折叠进度", value: String(format: "%.2f", progress))
                     ReadoutRow(label: "顶端宽度", value: String(format: "%.0f%%", 100 * topScale))
                     ReadoutRow(label: "顶端模糊", value: String(format: "%.0f pt", blur))
-                    Text("示意图：整屏截图横向拉成梯形，底边不动；模糊从顶端往下递减，梯形之外是黑色。")
+                    Text("示意图：整屏截图射影成梯形，底边不动；模糊在整行上从顶端往下递减，并散射进边缘的黑色。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

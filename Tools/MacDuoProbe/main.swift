@@ -231,6 +231,27 @@ enum RuntimeProbe {
         return samples > 0 ? total / Double(samples) : 0
     }
 
+    /// The same high-frequency measurement in one horizontal region. Checking
+    /// left, centre and right separately catches shaders that only frost the
+    /// middle of the projected picture.
+    static func localDetail(_ buffer: [UInt8], row: Int, xCenter: Int,
+                            width sampleWidth: Int = 160, band: Int = 16) -> Double {
+        var total = 0.0
+        var samples = 0
+        let yFirst = max(row - band / 2, 1)
+        let yLast = min(row + band / 2, height - 2)
+        let xFirst = max(xCenter - sampleWidth / 2, 1)
+        let xLast = min(xCenter + sampleWidth / 2, width - 2)
+        for y in yFirst..<yLast {
+            for x in xFirst..<xLast {
+                total += abs(Double(green(buffer, y, x + 1)) - Double(green(buffer, y, x)))
+                total += abs(Double(blue(buffer, y + 1, x)) - Double(blue(buffer, y, x)))
+                samples += 2
+            }
+        }
+        return samples > 0 ? total / Double(samples) : 0
+    }
+
     /// Width of the black-to-white transition in a row, normalised between the
     /// row's own black and white levels. For a Gaussian of standard deviation s
     /// the 10...90 width is 2.563 s, so this reads the blur out directly.
@@ -470,6 +491,7 @@ enum RuntimeProbe {
             print("homography: OK in both directions (no affine-triangle diagonal seam)")
             print("")
 
+            let sharpFold = render(measure, progress: 1.0)
             settings.maxBlurRadius = 72
 
             // MARK: 3. The blur ramp: heaviest at the top, nothing at the hinge
@@ -518,16 +540,37 @@ enum RuntimeProbe {
                                 sigmas[index - 1], wanted[index - 1]))
                 }
             }
-            guard sigmas[0] > 45 else {
+            // Coverage is blurred together with colour, so the very first row
+            // mixes with black outside the picture and reads slightly narrower
+            // than an infinite black/white edge would.
+            guard sigmas[0] > 30 else {
                 fail(String(format: "the top of the picture is barely blurred (sigma %.1f px)", sigmas[0]))
             }
             guard sigmas[sigmas.count - 1] < 2.0 else {
                 fail(String(format: "the hinge is not sharp (sigma %.1f px)", sigmas[sigmas.count - 1]))
             }
+            let fullWidthRow = Int(Double(height) * 0.12)
+            var regionalRatios: [Double] = []
+            for x in [width / 4, width / 2, width * 3 / 4] {
+                let sharp = localDetail(sharpFold, row: fullWidthRow, xCenter: x)
+                let soft = localDetail(blurred, row: fullWidthRow, xCenter: x)
+                regionalRatios.append(sharp > 0.0001 ? soft / sharp : 1)
+            }
+            print(String(format: "full-width frost: left %.1f%% · centre %.1f%% · right %.1f%% detail kept",
+                         regionalRatios[0] * 100, regionalRatios[1] * 100,
+                         regionalRatios[2] * 100))
+            guard regionalRatios.allSatisfy({ $0 < 0.25 }) else {
+                fail("the upper frost does not cover the full screen width")
+            }
             print("ramp: strongest at the top, monotone down to a sharp hinge")
             print("")
 
             // MARK: 4. Preview frames, for eyeballing the effect
+
+            // Geometry/blur measurements disable darkening so their pixel
+            // values remain measurable. Previews use the shipped reference-like
+            // default instead.
+            settings.farDarkening = 2
 
             if let outputDirectory {
                 try? FileManager.default.createDirectory(atPath: outputDirectory,

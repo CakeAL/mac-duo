@@ -18,9 +18,9 @@ enum EmbeddedShader {
 //  *bottom* edge is the bottom edge of the display and does not move. Only the
 //  top two corners come in as the lid folds. The clip-space w values describe
 //  one homography for the whole quad, like projecting a planar screen from a
-//  fixed eye; this is deliberately not two affine triangle warps. Whatever the
-//  trapezoid does not cover is the space behind the lid, and the target is
-//  cleared to black, so that is what shows there.
+//  fixed eye; this is deliberately not two affine triangle warps. The quad is
+//  enlarged by the blur support so the picture edge can scatter into the black
+//  around it instead of being clipped at the trapezoid boundary.
 //
 //  Blur (fragment stage): a radius that is the full amount at the top of the
 //  picture, zero at the bottom (the hinge), shaped by an exponent, and scaled by
@@ -89,12 +89,27 @@ vertex FrostVertexOut frost_vertex(uint vertexID [[vertex_id]],
     float c = (1.0 - edgeScale) / (1.0 + edgeScale);
     if (u.anchor >= 0.5) c = -c;
 
+    // The reference blurs image colour and image coverage together. Give the
+    // 5x5 kernel room to shade outside the original picture: its outer taps are
+    // two radii away. This is overdraw only; coverage in the fragment stage
+    // keeps everything beyond the scattered picture black.
+    float motion = smoothstep(0.0, 1.0, clamp(u.progress, 0.0, 1.0));
+    float support = 2.0 * max(u.blurRadiusPx, 0.0) * motion;
+    float2 sourceExtent = 1.0 + 2.0 * support / max(u.pictureSize, float2(1.0));
+    if (abs(c) > 0.0001) {
+        // Keep every homogeneous denominator positive even at the UI sliders'
+        // most extreme narrowing/blur combination.
+        sourceExtent.y = min(sourceExtent.y, 0.98 / abs(c));
+    }
+    float2 sourceCorner = corner * sourceExtent;
+
     FrostVertexOut out;
-    out.position = float4(corner.x * (1.0 - abs(c)),
-                          corner.y + c,
+    out.position = float4(sourceCorner.x * (1.0 - abs(c)),
+                          sourceCorner.y + c,
                           0.0,
-                          1.0 + c * corner.y);
-    out.uv = float2((corner.x + 1.0) * 0.5, (1.0 - corner.y) * 0.5);
+                          1.0 + c * sourceCorner.y);
+    out.uv = float2((sourceCorner.x + 1.0) * 0.5,
+                    (1.0 - sourceCorner.y) * 0.5);
     return out;
 }
 
@@ -134,6 +149,12 @@ fragment float4 frost_copy(FrostVertexOut in [[stage_in]],
 
 // MARK: - Composite
 
+static float pictureCoverage(float2 uv, float2 footprint) {
+    float2 inside = smoothstep(-footprint, footprint, uv)
+        * (1.0 - smoothstep(1.0 - footprint, 1.0 + footprint, uv));
+    return inside.x * inside.y;
+}
+
 fragment float4 frost_fragment(FrostVertexOut in [[stage_in]],
                                constant FrostUniforms &u [[buffer(0)]],
                                texture2d<float> picture [[texture(0)]]) {
@@ -142,20 +163,29 @@ fragment float4 frost_fragment(FrostVertexOut in [[stage_in]],
 
     float2 uv = in.uv;
     float progress = clamp(u.progress, 0.0, 1.0);
+    float motion = smoothstep(0.0, 1.0, progress);
+
+    // Keep the open state a literal pixel copy. Besides being cheaper, this
+    // avoids applying edge coverage to the first/last captured pixel.
+    if (motion <= 0.000001) {
+        return float4(picture.sample(linearSampler, uv, level(0.0)).rgb, 1.0);
+    }
 
     // 渐变从"远端"开始：远端最糊，钉住的那条边完全不糊。
     float towardFarEdge = clamp(1.0 - uv.y, 0.0, 1.0);
     float alongRamp = u.anchor < 0.5 ? towardFarEdge : (1.0 - towardFarEdge);
     float ramp = pow(alongRamp, clamp(u.falloff, 0.05, 4.0));
-    float radius = max(u.blurRadiusPx, 0.0) * progress * ramp;
+    float radius = max(u.blurRadiusPx, 0.0) * motion * ramp;
+    float2 texel = 1.0 / max(u.pictureSize, float2(1.0));
+    float2 aa = max(fwidth(uv), texel * 0.5);
 
     float3 color;
     if (radius < 0.35) {
         // Hinge side. Level 0 explicitly, so with the lid standing at 90° the
         // picture is passed through pixel for pixel.
-        color = picture.sample(linearSampler, uv, level(0.0)).rgb;
+        color = picture.sample(linearSampler, clamp(uv, 0.0, 1.0), level(0.0)).rgb
+            * pictureCoverage(uv, aa);
     } else {
-        float2 texel = 1.0 / max(u.pictureSize, float2(1.0));
         // Never sample finer than a screen pixel can resolve: without this the
         // wide kernel aliases into strips on high-frequency content.
         float baseLod = log2(max(1.0, max(length(dfdx(uv) * u.pictureSize),
@@ -163,6 +193,7 @@ fragment float4 frost_fragment(FrostVertexOut in [[stage_in]],
         float maxLod = floor(log2(max(max(u.pictureSize.x, u.pictureSize.y), 2.0)));
         float lod = clamp(max(baseLod, log2(max(radius, 1.0))), 0.0, maxLod);
         float2 spacing = radius * texel;
+        float2 footprint = max(aa, texel * radius * 0.75);
 
         // Weights 1 : 4 : 6 : 4 : 1 in both axes, normalised by 256. Spacing the
         // taps by the radius turns that kernel into a Gaussian of about that
@@ -173,19 +204,24 @@ fragment float4 frost_fragment(FrostVertexOut in [[stage_in]],
                 float wx = (x == 0) ? 6.0 : (abs(x) == 1 ? 4.0 : 1.0);
                 float wy = (y == 0) ? 6.0 : (abs(y) == 1 ? 4.0 : 1.0);
                 float2 tap = uv + float2(float(x), float(y)) * spacing;
-                sum += picture.sample(linearSampler, tap, level(lod)).rgb * (wx * wy);
+                float coverage = pictureCoverage(tap, footprint);
+                sum += picture.sample(linearSampler, clamp(tap, 0.0, 1.0), level(lod)).rgb
+                    * coverage * (wx * wy);
             }
         }
         color = sum * (1.0 / 256.0);
     }
 
-    // Optional extentions, both off at their defaults.
-    color *= 1.0 - min(1.0, progress * max(u.darkenGain, 0.0) * ramp);
+    // Match the reference's delayed darkening: the first fifth stays bright,
+    // then the far edge falls off faster than the blur itself.
+    float darkenGradient = clamp((alongRamp - 0.2) / 0.8, 0.0, 1.0);
+    float darken = motion * max(u.darkenGain, 0.0) * pow(darkenGradient, 1.35);
+    color *= 1.0 - min(1.0, darken);
 
     float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
-    float saturation = mix(1.0, clamp(u.frostSaturation, 0.0, 1.0), clamp(progress * ramp, 0.0, 1.0));
+    float saturation = mix(1.0, clamp(u.frostSaturation, 0.0, 1.0), clamp(motion * ramp, 0.0, 1.0));
     color = mix(float3(luma), color, saturation);
-    color = mix(color, float3(1.0), clamp(u.frostOpacity * progress * ramp, 0.0, 1.0));
+    color = mix(color, float3(1.0), clamp(u.frostOpacity * motion * ramp, 0.0, 1.0));
 
     return float4(color, 1.0);
 }
